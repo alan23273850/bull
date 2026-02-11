@@ -19,9 +19,9 @@ typedef struct {
 vector *vector_new (uscalar_t length);
 void vector_free (vector *vec);
 void vector_resize (vector *vec, uscalar_t new_length);
-inline uscalar_t vector_length (vector *vec);
-inline pointer_t vector_get (vector *vec, uscalar_t idx);
-inline void vector_set (vector *vec, uscalar_t idx, pointer_t elt);
-inline void vector_add (vector *vec, pointer_t elt);
+uscalar_t vector_length (vector *vec);
+pointer_t vector_get (vector *vec, uscalar_t idx);
+void vector_set (vector *vec, uscalar_t idx, pointer_t elt);
+void vector_add (vector *vec, pointer_t elt);
 
 #endif

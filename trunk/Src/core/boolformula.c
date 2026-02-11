@@ -18,25 +18,25 @@
 
 const lit NOT_A_LITERAL = 0;
 
-inline lit boolformula_lit_from_var (var v)
+lit boolformula_lit_from_var (var v)
 {
   assert (v > 0);
   return v;
 }
 
-inline var boolformula_var_from_lit (lit l)
+var boolformula_var_from_lit (lit l)
 {
   assert (l != 0);
   return l > 0 ? l : -l;
 }
 
-inline lit boolformula_lit_complement (lit l)
+lit boolformula_lit_complement (lit l)
 {
   assert (l != 0);
   return -l;
 }
 
-inline bool boolformula_positive_lit (lit l)
+bool boolformula_positive_lit (lit l)
 {
   assert (l != 0);
   return l > 0;
@@ -45,7 +45,7 @@ inline bool boolformula_positive_lit (lit l)
 /*
  * vector of length 0 is the unit of disjunction (F)
  */
-inline boolformula_t *boolformula_disjunction_unit (void)
+boolformula_t *boolformula_disjunction_unit (void)
 {
 	boolformula_t* ret=malloc(sizeof(boolformula_t));
 	ret->d.v=vector_new(0);
@@ -54,7 +54,7 @@ inline boolformula_t *boolformula_disjunction_unit (void)
 	return ret;
 }
 
-inline boolformula_t *boolformula_disjunction_new (uscalar_t length)
+boolformula_t *boolformula_disjunction_new (uscalar_t length)
 {
 	boolformula_t* ret=malloc(sizeof(boolformula_t));
 	ret->d.v=vector_new(length);
@@ -66,7 +66,7 @@ inline boolformula_t *boolformula_disjunction_new (uscalar_t length)
 /*
  * vector of length 0 is the unit of disjunction (T)
  */
-inline boolformula_t *boolformula_conjunction_unit (void)
+boolformula_t *boolformula_conjunction_unit (void)
 {
 	boolformula_t* ret=malloc(sizeof(boolformula_t));
 	ret->d.v=vector_new(0);
@@ -75,7 +75,7 @@ inline boolformula_t *boolformula_conjunction_unit (void)
 	return ret;
 }
 
-inline boolformula_t *boolformula_conjunction_new (uscalar_t length)
+boolformula_t *boolformula_conjunction_new (uscalar_t length)
 {
 	boolformula_t* ret=malloc(sizeof(boolformula_t));
 	ret->t=conjunct;
@@ -84,7 +84,7 @@ inline boolformula_t *boolformula_conjunction_new (uscalar_t length)
 	return ret;
 }
 
-inline boolformula_t *boolformula_literal_new (lit l)
+boolformula_t *boolformula_literal_new (lit l)
 {
 	boolformula_t* ret=malloc(sizeof(boolformula_t));
 	ret->d.l=l;
@@ -93,7 +93,7 @@ inline boolformula_t *boolformula_literal_new (lit l)
 	return ret;
 }
 
-inline boolformula_t *boolformula_add (boolformula_t *f,
+boolformula_t *boolformula_add (boolformula_t *f,
 		boolformula_t *g)
 {
 	assert(f->t!=literal);
@@ -102,7 +102,7 @@ inline boolformula_t *boolformula_add (boolformula_t *f,
 	return f;
 }
 
-inline boolformula_t *boolformula_set (boolformula_t *f, uscalar_t idx,
+boolformula_t *boolformula_set (boolformula_t *f, uscalar_t idx,
 		boolformula_t *g)
 {
 	assert(f->t!=literal);
@@ -112,7 +112,7 @@ inline boolformula_t *boolformula_set (boolformula_t *f, uscalar_t idx,
 }
 
 
-inline void boolformula_free (boolformula_t *f)
+void boolformula_free (boolformula_t *f)
 {
 	if(f->ref>1){
 		f->ref--;
@@ -130,7 +130,7 @@ inline void boolformula_free (boolformula_t *f)
 	free(f);
 }
 
-inline boolformula_t* boolformula_neg (boolformula_t * f){
+boolformula_t* boolformula_neg (boolformula_t * f){
 	int num_of_subformulae;
 	int i;
 	switch(f->t){
@@ -158,7 +158,7 @@ inline boolformula_t* boolformula_neg (boolformula_t * f){
 
 
 
-inline void add_clauses_to_boolformula(boolformula_t* ret, boolformula_t * f, lit* next_fresh){
+void add_clauses_to_boolformula(boolformula_t* ret, boolformula_t * f, lit* next_fresh){
 	int i;
 	boolformula_t* cur_neg=boolformula_literal_new(boolformula_lit_complement(*next_fresh));
 	boolformula_t* dis, *temp;
@@ -213,7 +213,7 @@ inline void add_clauses_to_boolformula(boolformula_t* ret, boolformula_t * f, li
 }
 
 
-inline boolformula_t *boolformula_to_cnf (boolformula_t * f, scalar_t num_var){
+boolformula_t *boolformula_to_cnf (boolformula_t * f, scalar_t num_var){
 	scalar_t next_fresh=num_var+1;
 	int i;
 	boolformula_t* ret=NULL;
@@ -237,22 +237,22 @@ inline boolformula_t *boolformula_to_cnf (boolformula_t * f, scalar_t num_var){
 	return ret;
 }
 
-inline enum type boolformula_get_type (boolformula_t * f){
+enum type boolformula_get_type (boolformula_t * f){
         assert (f->t == literal || f->t == conjunct || f->t == disjunct);
 	return f->t;
 }
 
-inline uscalar_t boolformula_get_length (boolformula_t * f){
+uscalar_t boolformula_get_length (boolformula_t * f){
 	assert(f->t == conjunct || f->t == disjunct);
         return vector_length (f->d.v);
 }
 
-inline boolformula_t *boolformula_get_subformula (boolformula_t * f, uscalar_t idx){
+boolformula_t *boolformula_get_subformula (boolformula_t * f, uscalar_t idx){
 	assert(f->t == conjunct || f->t == disjunct);
 	return vector_get(f->d.v, idx);
 }
 
-inline lit boolformula_get_value (boolformula_t * f){
+lit boolformula_get_value (boolformula_t * f){
 	assert(f->t==literal);
 	return f->d.l;
 }
@@ -318,7 +318,7 @@ scalar_t boolformula_num_of_var(boolformula_t* f){
 
 
 
-inline boolformula_t *boolformula_copy(boolformula_t * f){
+boolformula_t *boolformula_copy(boolformula_t * f){
 	boolformula_t* ret=NULL, *temp;
 	int i;
 	switch(f->t){

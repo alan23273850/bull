@@ -46,12 +46,12 @@ void bitvector_free (bitvector *bv)
   bv = NULL;
 }
 
-inline uscalar_t bitvector_length (bitvector *bv)
+uscalar_t bitvector_length (bitvector *bv)
 {
   return bv->length;
 }
 
-inline void bitvector_set (bitvector *bv, uscalar_t idx, bool b)
+void bitvector_set (bitvector *bv, uscalar_t idx, bool b)
 {
   assert (bv != NULL);
   assert (idx < bv->length);
@@ -61,7 +61,7 @@ inline void bitvector_set (bitvector *bv, uscalar_t idx, bool b)
     bv->buffer[get_array_idx(idx)] &= ~get_bit_pos(idx);
 }
 
-inline bool bitvector_get (bitvector *bv, uscalar_t idx)
+bool bitvector_get (bitvector *bv, uscalar_t idx)
 {
   assert (bv != NULL);
   assert (idx < bv->length);
