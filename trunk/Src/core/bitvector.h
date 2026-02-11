@@ -21,9 +21,9 @@ typedef struct {
 
 bitvector *bitvector_new (uscalar_t size);
 void bitvector_free (bitvector *bv);
-uscalar_t bitvector_length (bitvector *bv);
-void bitvector_set (bitvector *bv, uscalar_t idx, bool b);
-bool bitvector_get (bitvector *bv, uscalar_t idx);
+inline uscalar_t bitvector_length (bitvector *bv);
+inline void bitvector_set (bitvector *bv, uscalar_t idx, bool b);
+inline bool bitvector_get (bitvector *bv, uscalar_t idx);
 void bitvector_resize (bitvector *bv, uscalar_t new_size);
 bitvector *bitvector_xor (bitvector *bv0, bitvector *bv1);
 bitvector *bitvector_copy (bitvector *bv);

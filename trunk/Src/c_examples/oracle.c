@@ -303,7 +303,7 @@ int main(int argc, char *argv[]){
 	return 0;
 }
 
-sat_result_t* satisfible(boolformula_t * f){
+inline sat_result_t* satisfible(boolformula_t * f){
 	int tgtSize=0;
 #ifdef DEBUG
 	fprintf(stderr,"\n Ori:");

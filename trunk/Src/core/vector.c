@@ -61,25 +61,25 @@ void vector_resize (vector *vec, uscalar_t new_length)
   vec->length = new_length;
 }
 
-uscalar_t vector_length (vector *vec)
+inline uscalar_t vector_length (vector *vec)
 {
   assert (vec != NULL);
   return vec->length;
 }
 
-pointer_t vector_get (vector *vec, uscalar_t idx)
+inline pointer_t vector_get (vector *vec, uscalar_t idx)
 {
   assert (idx < vec->length);
   return vec->buffer[idx];
 }
 
-void vector_set (vector *vec, uscalar_t idx, pointer_t elt)
+inline void vector_set (vector *vec, uscalar_t idx, pointer_t elt)
 {
   assert (idx < vec->length);
   vec->buffer[idx] = elt;
 }
 
-void vector_add (vector *vec, pointer_t elt)
+inline void vector_add (vector *vec, pointer_t elt)
 {
   vector_resize (vec, vec->length + 1);
   vector_set (vec, vec->length - 1, elt);
