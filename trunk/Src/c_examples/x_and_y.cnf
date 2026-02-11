@@ -1,0 +1,7 @@
+c DIMACS CNF: x && y (two variables, both must be true)
+c x = variable 1, y = variable 2
+c Clause 1: (x)   -> literal 1
+c Clause 2: (y)   -> literal 2
+p cnf 2 2
+1 0
+2 0
