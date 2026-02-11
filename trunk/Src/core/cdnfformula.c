@@ -37,7 +37,7 @@ inline static monomial *cdnfformula_monomial_add (monomial *m, lit l)
  * M_DNF (bv) == /\_{i in I} X_i if I != empty
               == T               if I == empty
  */
-inline monomial *cdnfformula_monomial_M_DNF (bitvector *bv)
+extern inline monomial *cdnfformula_monomial_M_DNF (bitvector *bv)
 {
   uscalar_t i;
   monomial *result;
@@ -53,24 +53,24 @@ inline monomial *cdnfformula_monomial_M_DNF (bitvector *bv)
 /*
  * vector of length 0 is the unit of disjunction (F)
  */
-inline disjunction *cdnfformula_disjunction_unit (void)
+extern inline disjunction *cdnfformula_disjunction_unit (void)
 {
   return vector_new (0);
 }
 
-inline disjunction *cdnfformula_disjunction_new (uscalar_t length)
+extern inline disjunction *cdnfformula_disjunction_new (uscalar_t length)
 {
   return vector_new (length);
 }
 
-inline disjunction *cdnfformula_disjunction_add (disjunction *f,
+extern inline disjunction *cdnfformula_disjunction_add (disjunction *f,
                                                  monomial *disj)
 {
   vector_add (f, disj);
   return f;
 }
 
-inline void cdnfformula_disjunction_free (disjunction *disj)
+extern inline void cdnfformula_disjunction_free (disjunction *disj)
 {
   uscalar_t i, num_disjs;
 
@@ -87,24 +87,24 @@ inline void cdnfformula_disjunction_free (disjunction *disj)
 /*
  * vector of length 0 is the unit of conjunction (T)
  */
-inline conjunction *cdnfformula_conjunction_unit (void)
+extern inline conjunction *cdnfformula_conjunction_unit (void)
 {
   return vector_new (0);
 }
 
-inline conjunction *cdnfformula_conjunction_new (uscalar_t length)
+extern inline conjunction *cdnfformula_conjunction_new (uscalar_t length)
 {
   return vector_new (length);
 }
 
-inline conjunction *cdnfformula_conjunction_add (conjunction *f,
+extern inline conjunction *cdnfformula_conjunction_add (conjunction *f,
                                                  disjunction *conj)
 {
   vector_add (f, conj);
   return f;
 }
 
-inline void cdnfformula_free (conjunction *f)
+extern inline void cdnfformula_free (conjunction *f)
 {
   uscalar_t i, num_conjs;
 
@@ -201,7 +201,7 @@ bool cdnfformula_eval_M_DNF (disjunction *m_dnf, bitvector *bv)
   return false;
 }
 
-inline boolformula_t* monomial_to_boolformula (monomial *m)
+static inline boolformula_t* monomial_to_boolformula (monomial *m)
 {
   boolformula_t* ret=boolformula_conjunction_new(vector_length(m)),*temp;
 
@@ -214,7 +214,7 @@ inline boolformula_t* monomial_to_boolformula (monomial *m)
   return ret;
 }
 
-inline boolformula_t* dnf_to_boolformula (disjunction *f)
+static inline boolformula_t* dnf_to_boolformula (disjunction *f)
 {
   boolformula_t* ret=boolformula_disjunction_new(vector_length(f)), *temp;
 
@@ -227,7 +227,7 @@ inline boolformula_t* dnf_to_boolformula (disjunction *f)
   return ret;
 }
 
-inline boolformula_t *cdnfformula_to_boolformula (conjunction * f){
+extern inline boolformula_t *cdnfformula_to_boolformula (conjunction * f){
   boolformula_t* ret=boolformula_conjunction_new(vector_length(f)), *temp;
   uscalar_t i;
   for (i = 0; i < vector_length (f); i++) {

@@ -15,7 +15,7 @@ inline disjunction *cdnfformula_disjunction_new (uscalar_t length);
 inline disjunction *cdnfformula_disjunction_unit (void);
 inline disjunction *cdnfformula_disjunction_add (disjunction *, monomial *);
 inline void cdnfformula_disjunction_free (disjunction *);
-inline disjunction *cdnfformula_conjunction_new (uscalar_t length);
+inline conjunction *cdnfformula_conjunction_new (uscalar_t length);
 inline conjunction *cdnfformula_conjunction_unit (void);
 inline conjunction *cdnfformula_conjunction_add (conjunction *, disjunction *);
 inline void cdnfformula_free (conjunction *);
