@@ -9,7 +9,7 @@ type var_t = int
 
 type lit_t = int
 
-type boolformula_type_t = Lit | And | Or
+type boolformula_type_t = Lit | And | Or | Xor
 
 type boolformula_t
 
@@ -33,6 +33,9 @@ external create_disjunction : int -> boolformula_t
 
 external create_conjunction : int -> boolformula_t 
   = "ocaml_create_conjunction"
+
+external create_xor : int -> boolformula_t 
+  = "ocaml_create_xor"
 
 external add_boolformula : boolformula_t -> boolformula_t -> boolformula_t
   = "ocaml_add_boolformula"

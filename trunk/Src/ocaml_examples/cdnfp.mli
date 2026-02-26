@@ -9,7 +9,7 @@ type var_t = int
 
 type lit_t
 
-type boolformula_type_t = Lit | And | Or
+type boolformula_type_t = Lit | And | Or | Xor
 
 type boolformula_t
 
@@ -26,6 +26,8 @@ val from_literal : lit_t -> boolformula_t
 val create_disjunction : int -> boolformula_t
 
 val create_conjunction : int -> boolformula_t
+
+val create_xor : int -> boolformula_t
 
 val add_boolformula : boolformula_t -> boolformula_t -> boolformula_t
 

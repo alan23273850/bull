@@ -231,6 +231,8 @@ boolformula_t* read_DIMACS(){
 	char c;
 	c = getchar();
 	while (c != EOF) {
+	    while (c != EOF && (c == ' ' || c == '\n' || c == '\t')) c = getchar();
+	    if (c == EOF) break;
 	    if(c=='c'){
 	    	skipline();
 	    	c = getchar();
@@ -246,7 +248,24 @@ boolformula_t* read_DIMACS(){
 	    	scanf("%d",&num_var);
 	    	scanf("%d",&num_clauses);
 	    	skipline();
+	    	c = getchar();
+	    }else if(c=='x' || c=='X'){
+	    	/* XOR clause (CryptoMiniSat-style): x l1 l2 ... 0 => l1 XOR l2 XOR ... = true */
+	    	boolformula_t* xor_clause=boolformula_xor_unit();
+	    	do{
+	    		scanf("%d",&lit);
+	    		if(lit!=0){
+	    			temp=boolformula_literal_new(lit);
+	    			boolformula_add(xor_clause, temp);
+	    			boolformula_free(temp);
+	    		}
+	    	}while(lit!=0);
+	    	boolformula_add(ret, xor_clause);
+	    	boolformula_free(xor_clause);
+	    	skipline();
+	    	c = getchar();
 	    }else{
+	    	ungetc(c, stdin);
 	    	boolformula_t* clause=boolformula_disjunction_unit();
 	    	bool canAdd=false;
 	    	do{
@@ -261,7 +280,8 @@ boolformula_t* read_DIMACS(){
 	    	if(canAdd)
 	    		boolformula_add(ret,clause);
 		boolformula_free(clause);
-	    	c=skipline();
+	    	skipline();
+	    	c = getchar();
 	    }
 	}
 
@@ -273,7 +293,7 @@ void print_help(){
         printf(" mode = 0, using CDNF algorithm\n");
         printf(" mode = 1, using CDNF+ algorithm\n");
         printf(" mode = 2, using CDNF++ algorithm\n");
-        printf(" input should contain a CNF formula in DIMACS format\n");
+        printf(" input: DIMACS CNF (optional 'x' lines = XOR clauses, CryptoMiniSat-style)\n");
         exit(-1);
 }
 

@@ -21,7 +21,7 @@ typedef uscalar_t var;
 typedef scalar_t lit;
 extern const lit NOT_A_LITERAL;
 
-enum type{disjunct, conjunct, literal};
+enum type{disjunct, conjunct, exclusive_disjunct, literal};
 
 union data {
     lit l;
@@ -103,6 +103,24 @@ static inline boolformula_t *boolformula_literal_new (lit l)
 	return ret;
 }
 
+static inline boolformula_t *boolformula_xor_unit (void)
+{
+	boolformula_t* ret=(boolformula_t*)malloc(sizeof(boolformula_t));
+	ret->d.v=vector_new(0);
+	ret->t=exclusive_disjunct;
+	ret->ref=1;
+	return ret;
+}
+
+static inline boolformula_t *boolformula_xor_new (uscalar_t length)
+{
+	boolformula_t* ret=(boolformula_t*)malloc(sizeof(boolformula_t));
+	ret->d.v=vector_new(length);
+	ret->t=exclusive_disjunct;
+	ret->ref=1;
+	return ret;
+}
+
 static inline boolformula_t *boolformula_add (boolformula_t *f, boolformula_t *g)
 {
 	assert(f->t!=literal);
@@ -154,6 +172,11 @@ static inline boolformula_t* boolformula_neg (boolformula_t * f){
 			  boolformula_neg((boolformula_t*)vector_get (f->d.v, i));
 			}
 			break;
+		case exclusive_disjunct:
+			/* ¬(a⊕b⊕c) = (¬a)⊕b⊕c */
+			if (vector_length (f->d.v) > 0)
+				boolformula_neg((boolformula_t*)vector_get (f->d.v, 0));
+			break;
 		case literal:
 			f->d.l=-f->d.l;
 			break;
@@ -181,6 +204,14 @@ static inline boolformula_t *boolformula_copy(boolformula_t * f){
 			boolformula_free(temp);
 		}
 		break;
+	case exclusive_disjunct:
+		ret=boolformula_xor_new(vector_length(f->d.v));
+		for(i=0;i<vector_length(f->d.v);i++){
+			temp=boolformula_copy((boolformula_t*)vector_get(f->d.v,i));
+			boolformula_set(ret,i, temp);
+			boolformula_free(temp);
+		}
+		break;
 	case literal:
 		ret=boolformula_literal_new(f->d.l);
 		break;
@@ -189,8 +220,53 @@ static inline boolformula_t *boolformula_copy(boolformula_t * f){
 	return ret;
 }
 
+/* Add clauses for x ≡ a (equivalence): (¬x∨a) ∧ (¬a∨x) */
+static inline void add_lit_equiv_clauses(boolformula_t* ret, lit x, lit a){
+	boolformula_t* dis;
+	dis = boolformula_disjunction_new(2);
+	boolformula_set(dis, 0, boolformula_literal_new(boolformula_lit_complement(x)));
+	boolformula_set(dis, 1, boolformula_literal_new(a));
+	boolformula_add(ret, dis);
+	boolformula_free(dis);
+	dis = boolformula_disjunction_new(2);
+	boolformula_set(dis, 0, boolformula_literal_new(boolformula_lit_complement(a)));
+	boolformula_set(dis, 1, boolformula_literal_new(x));
+	boolformula_add(ret, dis);
+	boolformula_free(dis);
+}
+
+/* Add clauses for x ≡ (a⊕b): (¬x∨¬a∨¬b)∧(¬x∨a∨b)∧(x∨¬a∨b)∧(x∨a∨¬b) */
+static inline void add_xor_equiv_clauses(boolformula_t* ret, lit x, lit a, lit b){
+	boolformula_t* dis;
+	dis = boolformula_disjunction_new(3);
+	boolformula_set(dis, 0, boolformula_literal_new(boolformula_lit_complement(x)));
+	boolformula_set(dis, 1, boolformula_literal_new(boolformula_lit_complement(a)));
+	boolformula_set(dis, 2, boolformula_literal_new(boolformula_lit_complement(b)));
+	boolformula_add(ret, dis);
+	boolformula_free(dis);
+	dis = boolformula_disjunction_new(3);
+	boolformula_set(dis, 0, boolformula_literal_new(boolformula_lit_complement(x)));
+	boolformula_set(dis, 1, boolformula_literal_new(a));
+	boolformula_set(dis, 2, boolformula_literal_new(b));
+	boolformula_add(ret, dis);
+	boolformula_free(dis);
+	dis = boolformula_disjunction_new(3);
+	boolformula_set(dis, 0, boolformula_literal_new(x));
+	boolformula_set(dis, 1, boolformula_literal_new(boolformula_lit_complement(a)));
+	boolformula_set(dis, 2, boolformula_literal_new(b));
+	boolformula_add(ret, dis);
+	boolformula_free(dis);
+	dis = boolformula_disjunction_new(3);
+	boolformula_set(dis, 0, boolformula_literal_new(x));
+	boolformula_set(dis, 1, boolformula_literal_new(a));
+	boolformula_set(dis, 2, boolformula_literal_new(boolformula_lit_complement(b)));
+	boolformula_add(ret, dis);
+	boolformula_free(dis);
+}
+
 static inline void add_clauses_to_boolformula(boolformula_t* ret, boolformula_t * f, lit* next_fresh){
-	int i;
+	int i, n;
+	lit output, cur, val_i;
 	boolformula_t* cur_neg=boolformula_literal_new(boolformula_lit_complement(*next_fresh));
 	boolformula_t* dis, *temp;
 	switch(f->t){
@@ -232,6 +308,38 @@ static inline void add_clauses_to_boolformula(boolformula_t* ret, boolformula_t 
 		}
 		boolformula_free(dis);
 		break;
+	case exclusive_disjunct: {
+		n = (int)vector_length(f->d.v);
+		if (n == 0) break;
+		output = *next_fresh;
+		if (((boolformula_t*)vector_get(f->d.v, 0))->t == literal)
+			cur = ((boolformula_t*)vector_get(f->d.v, 0))->d.l;
+		else {
+			(*next_fresh)++;
+			cur = *next_fresh - 1;
+			add_clauses_to_boolformula(ret, (boolformula_t*)vector_get(f->d.v, 0), next_fresh);
+		}
+		if (n == 1) {
+			add_lit_equiv_clauses(ret, output, cur);
+			break;
+		}
+		for (i = 1; i < n; i++) {
+			if (((boolformula_t*)vector_get(f->d.v, i))->t == literal)
+				val_i = ((boolformula_t*)vector_get(f->d.v, i))->d.l;
+			else {
+				(*next_fresh)++;
+				val_i = *next_fresh - 1;
+				add_clauses_to_boolformula(ret, (boolformula_t*)vector_get(f->d.v, i), next_fresh);
+			}
+			if (i == n - 1)
+				add_xor_equiv_clauses(ret, output, cur, val_i);
+			else {
+				add_xor_equiv_clauses(ret, *next_fresh, cur, val_i);
+				cur = (*next_fresh)++;
+			}
+		}
+		break;
+	}
 	case literal:
 		printf("Something wrong\n");
 		exit(13);
@@ -251,6 +359,7 @@ static inline boolformula_t *boolformula_to_cnf (boolformula_t * f, scalar_t num
 		break;
 	case conjunct:
 	case disjunct:
+	case exclusive_disjunct:
 		ret=boolformula_conjunction_unit();
 		cur=boolformula_literal_new(next_fresh);
 		boolformula_add(ret, cur);
@@ -262,17 +371,17 @@ static inline boolformula_t *boolformula_to_cnf (boolformula_t * f, scalar_t num
 }
 
 static inline enum type boolformula_get_type (boolformula_t * f){
-	assert (f->t == literal || f->t == conjunct || f->t == disjunct);
+	assert (f->t == literal || f->t == conjunct || f->t == disjunct || f->t == exclusive_disjunct);
 	return f->t;
 }
 
 static inline uscalar_t boolformula_get_length (boolformula_t * f){
-	assert(f->t == conjunct || f->t == disjunct);
+	assert(f->t == conjunct || f->t == disjunct || f->t == exclusive_disjunct);
 	return vector_length (f->d.v);
 }
 
 static inline boolformula_t *boolformula_get_subformula (boolformula_t * f, uscalar_t idx){
-	assert(f->t == conjunct || f->t == disjunct);
+	assert(f->t == conjunct || f->t == disjunct || f->t == exclusive_disjunct);
 	return (boolformula_t*)vector_get(f->d.v, idx);
 }
 

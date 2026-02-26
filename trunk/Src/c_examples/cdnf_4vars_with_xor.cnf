@@ -1,0 +1,13 @@
+c DIMACS CNF + XOR (CryptoMiniSat-style)
+c Variables: w=1, x=2, y=3, z=4
+c
+c XOR clause: w XOR x = true  (line starting with 'x')
+c CNF clauses: same as cdnf_4vars.cnf
+c Formula: (w XOR x) ^ (w v x) ^ (-y v z) ^ (w v -x v y) ^ (-w v z)
+c
+p cnf 4 5
+x 1 2 0
+1 2 0
+-3 4 0
+1 -2 3 0
+-1 4 0

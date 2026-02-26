@@ -206,6 +206,14 @@ inline boolformula_t *boolformula_swap_xy(boolformula_t * f){
 			boolformula_free(temp);
 		}
 		break;
+	case exclusive_disjunct:
+		ret=boolformula_xor_new(f->d.v->length);
+		for(i=0;i<f->d.v->length;i++){
+			temp=boolformula_swap_xy(vector_get(f->d.v,i));
+			boolformula_set(ret,i, temp);
+			boolformula_free(temp);
+		}
+		break;
 	case literal:
 		if(f->d.l > 0)
 			ret=boolformula_literal_new(3-f->d.l);

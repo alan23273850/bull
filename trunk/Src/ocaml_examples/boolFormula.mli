@@ -8,7 +8,7 @@
 type var_t = int
 type lit_t = int
 
-type t = Lit of lit_t | Not of t | And of t array | Or of t array
+type t = Lit of lit_t | Not of t | And of t array | Or of t array | Xor of t array
 
 val is_positive : lit_t -> bool
 

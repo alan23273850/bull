@@ -57,7 +57,7 @@ static bitvector *bitvector_from_boolarray (value bary)
 /* boolformula */
 
 static void dealloc_boolformula (value bf);
-enum { CDNFP_LIT = 0, CDNFP_AND = 1, CDNFP_OR = 2 };
+enum { CDNFP_LIT = 0, CDNFP_AND = 1, CDNFP_OR = 2, CDNFP_XOR = 3 };
 
 static struct custom_operations boolformula_ops = {
   "cdnfp.boolformula",
@@ -152,6 +152,20 @@ value ocaml_create_conjunction (value l)
   CAMLreturn (result);
 }
 
+value ocaml_create_xor (value l)
+{
+  CAMLparam1 (l);
+  CAMLlocal1 (result);
+  uscalar_t len;
+  boolformula_t *bool_f;
+
+  len = Int_val (l);
+  bool_f = len > 0 ? 
+    boolformula_xor_new (len) : boolformula_xor_unit ();
+  result = Val_boolformula (bool_f);
+  CAMLreturn (result);
+}
+
 value ocaml_add_boolformula (value p, value c)
 {
   CAMLparam2 (p, c);
@@ -188,6 +202,7 @@ value ocaml_get_type (value f)
   switch (boolformula_get_type (bool_f)) {
   case disjunct: result = Val_int (CDNFP_OR); break;
   case conjunct: result = Val_int (CDNFP_AND); break;
+  case exclusive_disjunct: result = Val_int (CDNFP_XOR); break;
   case literal: result = Val_int (CDNFP_LIT); break;
   default: assert (0);
   };

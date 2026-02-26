@@ -50,6 +50,21 @@ void boolformula_print (boolformula_t *f)
 			    fprintf (stderr, " }");
 			  }
 			break;
+		case exclusive_disjunct:
+			  if (vector_length (f->d.v) == 0) {
+			    fprintf (stderr, "{ 0 }");
+			  } else {
+			    uscalar_t i;
+			    fprintf (stderr, "{ ");
+			    for (i = 0; i < vector_length (f->d.v)-1; i++) {
+			      boolformula_print ((boolformula_t*)vector_get (f->d.v, i));
+			      fprintf (stderr, " ^ ");
+			    }
+			    assert (i == vector_length (f->d.v)-1);
+			    boolformula_print ((boolformula_t*)vector_get (f->d.v, vector_length (f->d.v)-1));
+			    fprintf (stderr, " }");
+			  }
+			break;
 		case literal:
 		      fprintf (stderr, "%ld", (long)f->d.l);
 			break;
