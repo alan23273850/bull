@@ -20,12 +20,18 @@ $(PROGRAM) : $(OBJS)
 
 learn_inv: learn_inv.o minisat_stub.o
 	$(CXX) -o learn_inv learn_inv.o minisat_stub.o $(LDFLAGS)
+
+# Shared library for Python ctypes (decoder learning: fake solution only, no BULL/Z3)
+decoder_learning.o: decoder_learning.c
+	$(CC) $(CFLAGS) -fPIC -o decoder_learning.o decoder_learning.c
+libdecoder_learning.so: decoder_learning.o
+	$(CC) -shared -fPIC -o libdecoder_learning.so decoder_learning.o
+
 %.o:%.c
 	$(CC) $(CFLAGS) $<
 %.o:%.cc
 	$(CXX) $(CXXFLAGS) $<
 clean:
 	rm -f *.o 
-	rm -f learn 
-	rm -f learn_inv 
+	rm -f learn learn_inv libdecoder_learning.so
 
