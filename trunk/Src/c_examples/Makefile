@@ -23,9 +23,13 @@ learn_inv: learn_inv.o minisat_stub.o
 
 # Shared library for Python ctypes (decoder learning)
 decoder_learning.o: decoder_learning.c
-	$(CC) $(CFLAGS) -fPIC -o decoder_learning.o decoder_learning.c
-libdecoder_learning.so: decoder_learning.o
-	$(CC) -shared -fPIC -o libdecoder_learning.so decoder_learning.o -lz3 -L$(CORE) -l$(CORELIB)
+	$(CC) $(CFLAGS) -fPIC -c -o decoder_learning.o decoder_learning.c
+
+decoder_learning_helpers.o: decoder_learning_helpers.c
+	$(CC) $(CFLAGS) -fPIC -c -o decoder_learning_helpers.o decoder_learning_helpers.c
+
+libdecoder_learning.so: decoder_learning.o decoder_learning_helpers.o
+	$(CC) -shared -fPIC -o libdecoder_learning.so decoder_learning.o decoder_learning_helpers.o -lz3 -L$(CORE) -l$(CORELIB)
 
 %.o:%.c
 	$(CC) $(CFLAGS) $<
