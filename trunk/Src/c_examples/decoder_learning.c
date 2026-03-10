@@ -64,16 +64,119 @@
  static equivalence_result_t **eq_pending_result = NULL;  // dispatcher 填寫，learner 被 resume 時讀取
  static int global_eq_round_count = 0;           // 第 1 輪 odd 反例+填表，第 2 輪 even 反例+填表，第 3 輪起只驗表格
 
- // 全域/靜態變數供 Dispatcher 與 Learner 進行 Context Switch
- static ucontext_t dispatcher_ctx;
- static LearnerContext *global_learners = NULL;
- static int current_learner_id = -1;
- static int global_num_meas = 0;  // 測量向量長度，供 learn() 的 num_vars 使用
- static const char **global_meas_names = NULL;  // 變數編號 1..num_meas 對應的名稱，用於還原 formula 輸出
+// 全域/靜態變數供 Dispatcher 與 Learner 進行 Context Switch
+static ucontext_t dispatcher_ctx;
+static LearnerContext *global_learners = NULL;
+static int current_learner_id = -1;
+static int global_num_meas = 0;  // 測量向量長度，供 learn() 的 num_vars 使用
+static const char **global_meas_names = NULL;  // 變數編號 1..num_meas 對應的名稱，用於還原 formula 輸出
 
- // ============================================================================
- // 輔助函式：交出控制權 (Yield)
- // ============================================================================
+// Z3 全域變數
+static Z3_context z3_ctx = NULL;
+static Z3_solver z3_solver = NULL;
+static Z3_ast *z3_meas_vars = NULL;
+static Z3_ast *z3_dec_vars = NULL;
+static Z3_ast z3_all_commute = NULL;
+
+static int table_valid_entries = 0; // 統計 table 中被用到的 valid entry 數量
+
+// 將 boolformula_t 轉換為 Z3_ast
+static Z3_ast encode_boolformula_to_z3_ast(Z3_context ctx, boolformula_t *f, Z3_ast *meas_vars) {
+    if (!f) return Z3_mk_false(ctx);
+    switch (boolformula_get_type(f)) {
+        case literal: {
+            lit l = boolformula_get_value(f);
+            var v = boolformula_var_from_lit(l);
+            if (v < 1) return Z3_mk_false(ctx);
+            Z3_ast ast = meas_vars[v - 1];
+            return boolformula_positive_lit(l) ? ast : Z3_mk_not(ctx, ast);
+        }
+        case conjunct: {
+            uscalar_t len = boolformula_get_length(f);
+            if (len == 0) return Z3_mk_true(ctx);
+            Z3_ast *args = (Z3_ast *)malloc(len * sizeof(Z3_ast));
+            for (uscalar_t i = 0; i < len; i++) {
+                args[i] = encode_boolformula_to_z3_ast(ctx, boolformula_get_subformula(f, i), meas_vars);
+            }
+            Z3_ast res = Z3_mk_and(ctx, len, args);
+            free(args);
+            return res;
+        }
+        case disjunct: {
+            uscalar_t len = boolformula_get_length(f);
+            if (len == 0) return Z3_mk_false(ctx);
+            Z3_ast *args = (Z3_ast *)malloc(len * sizeof(Z3_ast));
+            for (uscalar_t i = 0; i < len; i++) {
+                args[i] = encode_boolformula_to_z3_ast(ctx, boolformula_get_subformula(f, i), meas_vars);
+            }
+            Z3_ast res = Z3_mk_or(ctx, len, args);
+            free(args);
+            return res;
+        }
+        case exclusive_disjunct: {
+            uscalar_t len = boolformula_get_length(f);
+            if (len == 0) return Z3_mk_false(ctx);
+            if (len == 1) return encode_boolformula_to_z3_ast(ctx, boolformula_get_subformula(f, 0), meas_vars);
+            Z3_ast res = encode_boolformula_to_z3_ast(ctx, boolformula_get_subformula(f, 0), meas_vars);
+            for (uscalar_t i = 1; i < len; i++) {
+                Z3_ast next = encode_boolformula_to_z3_ast(ctx, boolformula_get_subformula(f, i), meas_vars);
+                res = Z3_mk_xor(ctx, res, next);
+            }
+            return res;
+        }
+        default:
+            return Z3_mk_false(ctx);
+    }
+}
+
+// MQ 查不到表時，用 Z3 求解
+static void fill_meas_table_row_with_z3(size_t key, size_t meas_table_size, MeasToDecodersEntry *meas_to_decoders_table, int num_global_decoders, int global_num_meas) {
+    if (key >= meas_table_size || !meas_to_decoders_table) return;
+    MeasToDecodersEntry *e = &meas_to_decoders_table[key];
+    if (!e->c) return;
+
+    Z3_solver_push(z3_ctx, z3_solver);
+    
+    // 找正確答案: smt2_str + all_commute_name
+    Z3_solver_assert(z3_ctx, z3_solver, z3_all_commute);
+    
+    // 固定 meas_vars == key
+    for (int i = 0; i < global_num_meas; i++) {
+        bool bit = ((key >> i) & 1) != 0;
+        Z3_ast val = bit ? Z3_mk_true(z3_ctx) : Z3_mk_false(z3_ctx);
+        Z3_solver_assert(z3_ctx, z3_solver, Z3_mk_eq(z3_ctx, z3_meas_vars[i], val));
+    }
+    
+    Z3_lbool res = Z3_solver_check(z3_ctx, z3_solver);
+    if (res == Z3_L_TRUE) {
+        Z3_model model = Z3_solver_get_model(z3_ctx, z3_solver);
+        Z3_model_inc_ref(z3_ctx, model);
+        for (int j = 0; j < num_global_decoders; j++) {
+            Z3_ast eval_res;
+            Z3_model_eval(z3_ctx, model, z3_dec_vars[j], true, &eval_res);
+            e->c[j] = (Z3_get_bool_value(z3_ctx, eval_res) == Z3_L_TRUE);
+        }
+        Z3_model_dec_ref(z3_ctx, model);
+    } else {
+        // UNSAT (BULL 給的 meas 無解) -> 給每個 decoder false
+        for (int j = 0; j < num_global_decoders; j++) {
+            e->c[j] = false;
+        }
+    }
+    
+    Z3_solver_pop(z3_ctx, z3_solver, 1);
+    e->valid = true;
+    table_valid_entries++;
+    
+    fprintf(stderr, "[Table] MQ Z3 填 key=%zu columns:", key);
+    for (int d = 0; d < num_global_decoders; d++)
+        fprintf(stderr, " %d", e->c[d] ? 1 : 0);
+    fprintf(stderr, "\n");
+}
+
+// ============================================================================
+// 輔助函式：交出控制權 (Yield)
+// ============================================================================
  // Learner 呼叫此函式，必定會跳回主迴圈的 Dispatcher 區域
  static void yield_to_dispatcher() {
      if (current_learner_id >= 0) {
@@ -85,8 +188,8 @@
  // Learner 的主邏輯 (跑在自己獨立的 Stack 上)
  // ============================================================================
 
-// Membership Query：查 meas → decoders 表；若該 key 沒有則為「所有 decoder」隨機生一組值並寫入表，再回傳當前 decoder 的值
-static membership_result_t proto_membership(void *info, bitvector *bv) {
+// Membership Query：查 meas → decoders 表；若該 key 沒有則用 Z3 求解
+static membership_result_t membership(void *info, bitvector *bv) {
     (void)info;
     if (!meas_to_decoders_table || current_learner_id < 0 || current_learner_id >= num_global_decoders) {
         fprintf(stderr, "[MQ] learner=%d 表未就緒或 id 無效，回傳 true\n", current_learner_id);
@@ -101,9 +204,7 @@ static membership_result_t proto_membership(void *info, bitvector *bv) {
     MeasToDecodersEntry *e = &meas_to_decoders_table[key];
     if (!e->c) return true;
     if (!e->valid) {
-        fprintf(stderr, "[MQ] learner=%d key=%zu 表未填，依 conjecture 填其他 learner（不讓其他人反例）\n",
-                current_learner_id, key);
-        fill_meas_table_row_for_mq(key, current_learner_id, meas_table_size, meas_to_decoders_table, num_global_decoders, global_num_meas, pending_formula);
+        fill_meas_table_row_with_z3(key, meas_table_size, meas_to_decoders_table, num_global_decoders, global_num_meas);
     }
     bool out = e->c[current_learner_id];
     fprintf(stderr, "[MQ] learner=%d key=%zu -> %d\n", current_learner_id, key, out ? 1 : 0);
@@ -112,9 +213,9 @@ static membership_result_t proto_membership(void *info, bitvector *bv) {
 
 
 // Equivalence Query：交出 hypothesis 給 dispatcher，yield；被 resume 時回傳 global 的結果（反例或收斂）
-static equivalence_result_t *proto_equivalence(void *info,
-                                               uscalar_t num_vars,
-                                               boolformula_t *b) {
+static equivalence_result_t *equivalence(void *info,
+                                         uscalar_t num_vars,
+                                         boolformula_t *b) {
     (void)info;
     (void)num_vars;
     int id = current_learner_id;
@@ -145,7 +246,7 @@ static equivalence_result_t *proto_equivalence(void *info,
      LearnerContext *me = &global_learners[id];
      me->state = L_RUNNING;
 
-     printf("[Learner %d (%s)] 啟動！\n", id, me->name);
+     fprintf(stderr, "[Learner %d (%s)] 啟動！\n", id, me->name);
 
     // 這裡直接呼叫 BULL 的 learn()，使用簡化版的 membership / equivalence。
     void *info = NULL;
@@ -154,10 +255,10 @@ static equivalence_result_t *proto_equivalence(void *info,
 
     boolformula_t *f = learn(info,
                              num_vars,
-                             proto_membership,   // MEM：永遠 true
-                             NULL,               // COMEM：目前不用
-                             proto_equivalence,  // EQ：答案為 true
-                             CDNF);              // 先用最基本模式
+                             membership,   // MEM
+                             NULL,         // COMEM
+                             equivalence,  // EQ
+                             CDNF);        // 先用最基本模式
 
     if (f) {
         me->result_formula = f; // 接到階段 3，由主流程寫入 JSON 後再 free
@@ -169,7 +270,7 @@ static equivalence_result_t *proto_equivalence(void *info,
         fprintf(stderr, "[Learner %d] learn() 回傳 NULL（可能是 prototype 還沒接好）。\n", id);
     }
 
-    printf("[Learner %d (%s)] DONE！\n", id, me->name);
+    fprintf(stderr, "[Learner %d (%s)] DONE！\n", id, me->name);
      me->state = L_DONE;
 
      // 徹底結束前，最後一次跳回 Dispatcher
@@ -177,31 +278,69 @@ static equivalence_result_t *proto_equivalence(void *info,
  }
 
  // ============================================================================
- // 主程式進入點
- // ============================================================================
- EXPORT char *decoder_learning_in_C(
-     const char *smt2_str,
-     const char **meas_names,
-     int num_meas,
-     const char **decoder_names,
-     int num_decoders,
-     const char *all_commute_name)
- {
-    (void)smt2_str;
-    (void)all_commute_name;
-
-    global_meas_names = meas_names;  /* 變數 1..num_meas 對應 meas_names[0..num_meas-1]，供 formula 還原成名稱 */
-
-    if (num_decoders <= 0 || num_meas <= 0) {
-         char *empty = (char *)malloc(3);
-         if (empty) { empty[0] = '{'; empty[1] = '}'; empty[2] = '\0'; }
-         return empty;
-     }
-
+// 主程式進入點
+// ============================================================================
+EXPORT char *decoder_learning_in_C(
+    const char *smt2_str,
+    const char **meas_names,
+    int num_meas,
+    const char **decoder_names,
+    int num_decoders,
+    const char *all_commute_name)
+{
+    // 確保每次呼叫時全域變數都重置為初始狀態
+    global_meas_names = meas_names;
     num_global_decoders = num_decoders;
     global_num_meas = num_meas;
     global_eq_round_count = 0;
+    table_valid_entries = 0;
+    current_learner_id = -1;
+    meas_to_decoders_table = NULL;
+    meas_table_size = 0;
+    pending_formula = NULL;
+    eq_pending_result = NULL;
+    global_learners = NULL;
+    z3_ctx = NULL;
+    z3_solver = NULL;
+    z3_meas_vars = NULL;
+    z3_dec_vars = NULL;
+    z3_all_commute = NULL;
+
+    char *json_result = NULL;
+
+    if (num_decoders <= 0 || num_meas <= 0) {
+        json_result = (char *)malloc(3);
+        if (json_result) { json_result[0] = '{'; json_result[1] = '}'; json_result[2] = '\0'; }
+        return json_result;
+    }
+
     srand((unsigned)time(NULL));
+
+    // 初始化 Z3
+    Z3_config cfg = Z3_mk_config();
+    z3_ctx = Z3_mk_context(cfg);
+    Z3_del_config(cfg);
+    z3_solver = Z3_mk_solver(z3_ctx);
+    Z3_solver_inc_ref(z3_ctx, z3_solver);
+
+    // 解析 smt2_str (包含 assert)
+    Z3_ast_vector ast_vec = Z3_parse_smtlib2_string(z3_ctx, smt2_str, 0, NULL, NULL, 0, NULL, NULL);
+    Z3_ast_vector_inc_ref(z3_ctx, ast_vec);
+    for (unsigned i = 0; i < Z3_ast_vector_size(z3_ctx, ast_vec); i++) {
+        Z3_solver_assert(z3_ctx, z3_solver, Z3_ast_vector_get(z3_ctx, ast_vec, i));
+    }
+    Z3_ast_vector_dec_ref(z3_ctx, ast_vec);
+
+    Z3_sort bool_sort = Z3_mk_bool_sort(z3_ctx);
+    z3_meas_vars = (Z3_ast *)malloc(num_meas * sizeof(Z3_ast));
+    for (int i = 0; i < num_meas; i++) {
+        z3_meas_vars[i] = Z3_mk_const(z3_ctx, Z3_mk_string_symbol(z3_ctx, meas_names[i]), bool_sort);
+    }
+    z3_dec_vars = (Z3_ast *)malloc(num_decoders * sizeof(Z3_ast));
+    for (int i = 0; i < num_decoders; i++) {
+        z3_dec_vars[i] = Z3_mk_const(z3_ctx, Z3_mk_string_symbol(z3_ctx, decoder_names[i]), bool_sort);
+    }
+    z3_all_commute = Z3_mk_const(z3_ctx, Z3_mk_string_symbol(z3_ctx, all_commute_name), bool_sort);
 
      // 表格：meas → decoders，key = 0 .. 2^num_meas - 1
      meas_table_size = (size_t)1 << (num_meas <= (int)(sizeof(size_t) * 8) ? num_meas : 0);
@@ -245,7 +384,7 @@ static equivalence_result_t *proto_equivalence(void *info,
     // ---------------------------------------------------------
     // 階段 2：主迴圈 Dispatcher；全部 L_WAIT_EQ 時做 global EQ，滿 3 輪宣佈收斂
     // ---------------------------------------------------------
-    printf("\n=== 進入 Dispatcher 區域 ===\n");
+    fprintf(stderr, "\n=== 進入 Dispatcher 區域 ===\n");
     int active_learners = num_decoders;
 
     while (active_learners > 0) {
@@ -275,189 +414,112 @@ static equivalence_result_t *proto_equivalence(void *info,
          }
          if (!all_wait_eq) continue;
 
-         // 3. 全部都在等 EQ → 第 1 輪 odd 反例+填表；第 2 輪 even 反例+填表；第 3 輪起只驗表格
-         global_eq_round_count++;
-         int n = global_num_meas > 0 ? global_num_meas : 1;
-         fprintf(stderr, "[Dispatcher] Global EQ 第 %d 輪（1=odd反例 2=even反例 3+=只驗表格）\n", global_eq_round_count);
+        // 3. 全部都在等 EQ → 使用 Z3 找反例
+        fprintf(stderr, "[Dispatcher] Global EQ: 使用 Z3 尋找反例\n");
+        
+        Z3_solver_push(z3_ctx, z3_solver);
+        Z3_solver_assert(z3_ctx, z3_solver, Z3_mk_not(z3_ctx, z3_all_commute));
+        
+        for (int i = 0; i < num_decoders; i++) {
+            if (pending_formula[i]) {
+                Z3_ast conj_ast = encode_boolformula_to_z3_ast(z3_ctx, pending_formula[i], z3_meas_vars);
+                Z3_solver_assert(z3_ctx, z3_solver, Z3_mk_eq(z3_ctx, z3_dec_vars[i], conj_ast));
+            }
+        }
+        
+        Z3_lbool res = Z3_solver_check(z3_ctx, z3_solver);
+        
+        if (res == Z3_L_TRUE) {
+            // 找到反例！
+            Z3_model model = Z3_solver_get_model(z3_ctx, z3_solver);
+            Z3_model_inc_ref(z3_ctx, model);
+            
+            size_t key = 0;
+            for (int i = 0; i < global_num_meas && i < sizeof(size_t) * 8; i++) {
+                Z3_ast eval_res;
+                Z3_model_eval(z3_ctx, model, z3_meas_vars[i], true, &eval_res);
+                if (Z3_get_bool_value(z3_ctx, eval_res) == Z3_L_TRUE) {
+                    key |= ((size_t)1 << i);
+                }
+            }
+            Z3_model_dec_ref(z3_ctx, model);
+            Z3_solver_pop(z3_ctx, z3_solver, 1);
+            
+            fprintf(stderr, "[Dispatcher] Z3 找到反例 key=%zu\n", key);
+            
+            // 確保這個 key 在表裡有正確答案
+            if (!meas_to_decoders_table[key].valid) {
+                fill_meas_table_row_with_z3(key, meas_table_size, meas_to_decoders_table, num_decoders, global_num_meas);
+            }
+            
+            // 找出哪些 learner 猜錯了，給他們反例並喚醒
+            int n = global_num_meas > 0 ? global_num_meas : 1;
+            bool *vals = (bool *)malloc((size_t)(n + 1) * sizeof(bool));
+            for (int v = 1; v <= n; v++) vals[v] = ((key >> (v - 1)) & 1) != 0;
+            
+            for (int i = 0; i < num_decoders; i++) {
+                if (global_learners[i].state != L_WAIT_EQ) continue;
+                bool pred = pending_formula[i] ? eval_boolformula_with_vals(pending_formula[i], vals) : false;
+                bool truth = meas_to_decoders_table[key].c[i];
+                if (pred != truth) {
+                    equivalence_result_t *r = (equivalence_result_t *)malloc(sizeof(equivalence_result_t));
+                    r->is_equal = false;
+                    r->counterexample = bitvector_new((uscalar_t)(n + 1));
+                    bitvector_set(r->counterexample, 0, truth);
+                    for (int j = 0; j < n; j++)
+                        bitvector_set(r->counterexample, (uscalar_t)(j + 1), ((key >> j) & 1) != 0);
+                    eq_pending_result[i] = r;
+                    global_learners[i].state = L_RUNNING;
+                    current_learner_id = i;
+                    swapcontext(&dispatcher_ctx, &global_learners[i].ctx);
+                }
+            }
+            free(vals);
+            
+        } else {
+            // UNSAT (或 UNKNOWN) -> 沒有反例，全部正確！
+            Z3_solver_pop(z3_ctx, z3_solver, 1);
+            fprintf(stderr, "[Dispatcher] Z3 證明全部正確！\n");
+            
+            for (int i = 0; i < num_decoders; i++) {
+                if (global_learners[i].state != L_WAIT_EQ) continue;
+                eq_pending_result[i] = (equivalence_result_t *)malloc(sizeof(equivalence_result_t));
+                if (eq_pending_result[i]) {
+                    eq_pending_result[i]->is_equal = true;
+                    eq_pending_result[i]->counterexample = NULL;
+                }
+                current_learner_id = i;
+                swapcontext(&dispatcher_ctx, &global_learners[i].ctx);
+            }
+        }
+    }
+     fprintf(stderr, "=== Dispatcher 結束：所有 Learner 皆已 DONE ===\n\n");
 
-         if (global_eq_round_count == 1) {
-             // 第一輪：挑 key，odd 反例 / even 正確，填表後只給 odd learner 反例
-             size_t key = (size_t)(rand() % (int)meas_table_size);
-             int tries = 0;
-             while (meas_to_decoders_table[key].valid && tries < (int)meas_table_size) {
-                 key = (key + 1) % meas_table_size;
-                 tries++;
-             }
-             if (meas_to_decoders_table[key].valid) {
-                 fprintf(stderr, "[Dispatcher] 表已滿，改做比對表內 entry\n");
-                 global_eq_round_count = 3;
-             } else {
-                 if (meas_to_decoders_table[key].valid) continue;
+    // ---------------------------------------------------------
+    // 階段 3：收集答案並產生 JSON（公式轉成 Z3/SMT-LIB2 格式再傳回 Python）
+    // ---------------------------------------------------------
+    if (global_learners) {
+        json_result = build_results_json(global_learners, num_decoders, decoder_names, global_meas_names, global_num_meas);
+    } else {
+        json_result = strdup("{}");
+    }
+    printf("Table Size: %d\n", table_valid_entries);
 
-                 bool *vals = (bool *)malloc((size_t)(n + 1) * sizeof(bool));
-                 if (!vals) continue;
-                 for (int v = 1; v <= n; v++)
-                     vals[v] = ((key >> (v - 1)) & 1) != 0;
+cleanup:
+    if (!json_result) json_result = strdup("{}");
+    cleanup_learning_resources(&meas_to_decoders_table, meas_table_size,
+                               &pending_formula, num_decoders,
+                               &eq_pending_result,
+                               &global_learners);
 
-                 for (int i = 0; i < num_decoders; i++) {
-                     bool pred = pending_formula[i] ? eval_boolformula_with_vals(pending_formula[i], vals) : false;
-                     if (i & 1)
-                         meas_to_decoders_table[key].c[i] = !pred;  /* odd：反例 */
-                     else
-                         meas_to_decoders_table[key].c[i] = pred;   /* even：正確，與 hypothesis 一致 */
-                 }
-                 meas_to_decoders_table[key].valid = true;
-                 fprintf(stderr, "[Dispatcher] 加入 key=%zu columns:", key);
-                 for (int d = 0; d < num_decoders; d++)
-                     fprintf(stderr, " %d", meas_to_decoders_table[key].c[d] ? 1 : 0);
-                 fprintf(stderr, "\n");
+    if (z3_meas_vars) free(z3_meas_vars);
+    if (z3_dec_vars) free(z3_dec_vars);
+    if (z3_solver) {
+        Z3_solver_dec_ref(z3_ctx, z3_solver);
+    }
+    if (z3_ctx) {
+        Z3_del_context(z3_ctx);
+    }
 
-                 for (int i = 0; i < num_decoders; i++) {
-                     if (global_learners[i].state != L_WAIT_EQ || !pending_formula[i]) continue;
-                     if (!(i & 1)) continue;
-                     bool truth = meas_to_decoders_table[key].c[i];
-                     equivalence_result_t *r = (equivalence_result_t *)malloc(sizeof(equivalence_result_t));
-                     if (!r) continue;
-                     r->is_equal = false;
-                     r->counterexample = bitvector_new((uscalar_t)(n + 1));
-                     bitvector_set(r->counterexample, 0, truth);   /* BULL: index 0 = 輸出 */
-                     for (int j = 0; j < n; j++)
-                         bitvector_set(r->counterexample, (uscalar_t)(j + 1), ((key >> j) & 1) != 0);  /* index 1..n = 輸入 */
-                     eq_pending_result[i] = r;
-                     global_learners[i].state = L_RUNNING;
-                     current_learner_id = i;
-                     swapcontext(&dispatcher_ctx, &global_learners[i].ctx);
-                 }
-                 free(vals);
-             }
-         } else if (global_eq_round_count == 2) {
-             // 第二輪：挑 key，odd 正確 / even 反例，填表後只給 even learner 反例
-             size_t key = (size_t)(rand() % (int)meas_table_size);
-             int tries = 0;
-             while (meas_to_decoders_table[key].valid && tries < (int)meas_table_size) {
-                 key = (key + 1) % meas_table_size;
-                 tries++;
-             }
-             if (meas_to_decoders_table[key].valid) {
-                 fprintf(stderr, "[Dispatcher] 表已滿，改做比對表內 entry\n");
-                 global_eq_round_count = 3;
-             } else {
-                 if (meas_to_decoders_table[key].valid) continue;
-
-                 bool *vals = (bool *)malloc((size_t)(n + 1) * sizeof(bool));
-                 if (!vals) continue;
-                 for (int v = 1; v <= n; v++)
-                     vals[v] = ((key >> (v - 1)) & 1) != 0;
-
-                 for (int i = 0; i < num_decoders; i++) {
-                     bool pred = pending_formula[i] ? eval_boolformula_with_vals(pending_formula[i], vals) : false;
-                     if (i & 1)
-                         meas_to_decoders_table[key].c[i] = pred;   /* odd：正確 */
-                     else
-                         meas_to_decoders_table[key].c[i] = !pred;  /* even：反例 */
-                 }
-                 meas_to_decoders_table[key].valid = true;
-                 fprintf(stderr, "[Dispatcher] 加入 key=%zu columns:", key);
-                 for (int d = 0; d < num_decoders; d++)
-                     fprintf(stderr, " %d", meas_to_decoders_table[key].c[d] ? 1 : 0);
-                 fprintf(stderr, "\n");
-
-                 for (int i = 0; i < num_decoders; i++) {
-                     if (global_learners[i].state != L_WAIT_EQ || !pending_formula[i]) continue;
-                     if (i & 1) continue;
-                     bool truth = meas_to_decoders_table[key].c[i];
-                     equivalence_result_t *r = (equivalence_result_t *)malloc(sizeof(equivalence_result_t));
-                     if (!r) continue;
-                     r->is_equal = false;
-                     r->counterexample = bitvector_new((uscalar_t)(n + 1));
-                     bitvector_set(r->counterexample, 0, truth);
-                     for (int j = 0; j < n; j++)
-                         bitvector_set(r->counterexample, (uscalar_t)(j + 1), ((key >> j) & 1) != 0);
-                     eq_pending_result[i] = r;
-                     global_learners[i].state = L_RUNNING;
-                     current_learner_id = i;
-                     swapcontext(&dispatcher_ctx, &global_learners[i].ctx);
-                 }
-                 free(vals);
-             }
-         }
-
-         if (global_eq_round_count >= 3) {
-             // 第三輪起：只比對表內所有 entry，有 mismatch 就給反例；無人被給反例則宣佈大家正確
-             bool *vals = (bool *)malloc((size_t)(n + 1) * sizeof(bool));
-             if (!vals) continue;
-             int gave_cex = 0;
-             for (int i = 0; i < num_decoders; i++) {
-                 if (global_learners[i].state != L_WAIT_EQ || !pending_formula[i]) continue;
-                 int found_cex = 0;
-                 for (size_t k = 0; k < meas_table_size && !found_cex; k++) {
-                     if (!meas_to_decoders_table[k].valid) continue;
-                     for (int v = 1; v <= n; v++)
-                         vals[v] = ((k >> (v - 1)) & 1) != 0;
-                     bool pred = eval_boolformula_with_vals(pending_formula[i], vals);
-                     bool truth = meas_to_decoders_table[k].c[i];
-                     if (pred != truth) {
-                         equivalence_result_t *r = (equivalence_result_t *)malloc(sizeof(equivalence_result_t));
-                         if (!r) continue;
-                         r->is_equal = false;
-                         r->counterexample = bitvector_new((uscalar_t)(n + 1));
-                         bitvector_set(r->counterexample, 0, truth);
-                         for (int j = 0; j < n; j++)
-                             bitvector_set(r->counterexample, (uscalar_t)(j + 1), ((k >> j) & 1) != 0);
-                         eq_pending_result[i] = r;
-                         global_learners[i].state = L_RUNNING;
-                         current_learner_id = i;
-                         swapcontext(&dispatcher_ctx, &global_learners[i].ctx);
-                         gave_cex = 1;
-                         found_cex = 1;
-                         break;
-                     }
-                 }
-             }
-             free(vals);
-             if (!gave_cex) {
-                 fprintf(stderr, "[Dispatcher] 大家正確，各 learner 公式如下：\n");
-                 for (int i = 0; i < num_decoders; i++) {
-                     if (global_learners[i].state != L_WAIT_EQ) continue;
-                     const char *name = global_learners[i].name ? global_learners[i].name : "";
-                     fprintf(stderr, "  [%d] %s: ", i, name);
-                     if (pending_formula[i]) {
-                         boolformula_print(pending_formula[i]);
-                         fprintf(stderr, "\n");
-                     } else {
-                         fprintf(stderr, "(null)\n");
-                     }
-                 }
-                 for (int i = 0; i < num_decoders; i++) {
-                     if (global_learners[i].state != L_WAIT_EQ) continue;
-                     eq_pending_result[i] = (equivalence_result_t *)malloc(sizeof(equivalence_result_t));
-                     if (eq_pending_result[i]) {
-                         eq_pending_result[i]->is_equal = true;
-                         eq_pending_result[i]->counterexample = NULL;
-                     }
-                     current_learner_id = i;
-                     swapcontext(&dispatcher_ctx, &global_learners[i].ctx);
-                 }
-             }
-         }
-     }
-     printf("=== Dispatcher 結束：所有 Learner 皆已 DONE ===\n\n");
-
-     // ---------------------------------------------------------
-     // 階段 3：收集答案並產生 JSON（公式轉成 Z3/SMT-LIB2 格式再傳回 Python）
-     // ---------------------------------------------------------
- cleanup:
-     char *json_result = NULL;
-     if (global_learners) {
-         json_result = build_results_json(global_learners, num_decoders, decoder_names, global_meas_names, global_num_meas);
-     } else {
-         json_result = strdup("{}");
-     }
-
-     cleanup_learning_resources(&meas_to_decoders_table, meas_table_size,
-                                &pending_formula, num_decoders,
-                                &eq_pending_result,
-                                &global_learners);
-
-     return json_result;
- }
+    return json_result;
+}
