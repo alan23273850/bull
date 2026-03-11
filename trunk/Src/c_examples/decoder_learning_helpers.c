@@ -13,7 +13,101 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <z3.h>
 #include "decoder_learning_helpers.h"
+
+// 將 boolformula_t 轉換為 Z3_ast
+Z3_ast encode_boolformula_to_z3_ast(Z3_context ctx, boolformula_t *f, Z3_ast *meas_vars) {
+    if (!f) return Z3_mk_false(ctx);
+    switch (boolformula_get_type(f)) {
+        case literal: {
+            lit l = boolformula_get_value(f);
+            var v = boolformula_var_from_lit(l);
+            if (v < 1) return Z3_mk_false(ctx);
+            Z3_ast ast = meas_vars[v - 1];
+            return boolformula_positive_lit(l) ? ast : Z3_mk_not(ctx, ast);
+        }
+        case conjunct: {
+            uscalar_t len = boolformula_get_length(f);
+            if (len == 0) return Z3_mk_true(ctx);
+            Z3_ast *args = (Z3_ast *)malloc(len * sizeof(Z3_ast));
+            for (uscalar_t i = 0; i < len; i++) {
+                args[i] = encode_boolformula_to_z3_ast(ctx, boolformula_get_subformula(f, i), meas_vars);
+            }
+            Z3_ast res = Z3_mk_and(ctx, len, args);
+            free(args);
+            return res;
+        }
+        case disjunct: {
+            uscalar_t len = boolformula_get_length(f);
+            if (len == 0) return Z3_mk_false(ctx);
+            Z3_ast *args = (Z3_ast *)malloc(len * sizeof(Z3_ast));
+            for (uscalar_t i = 0; i < len; i++) {
+                args[i] = encode_boolformula_to_z3_ast(ctx, boolformula_get_subformula(f, i), meas_vars);
+            }
+            Z3_ast res = Z3_mk_or(ctx, len, args);
+            free(args);
+            return res;
+        }
+        case exclusive_disjunct: {
+            uscalar_t len = boolformula_get_length(f);
+            if (len == 0) return Z3_mk_false(ctx);
+            if (len == 1) return encode_boolformula_to_z3_ast(ctx, boolformula_get_subformula(f, 0), meas_vars);
+            Z3_ast res = encode_boolformula_to_z3_ast(ctx, boolformula_get_subformula(f, 0), meas_vars);
+            for (uscalar_t i = 1; i < len; i++) {
+                Z3_ast next = encode_boolformula_to_z3_ast(ctx, boolformula_get_subformula(f, i), meas_vars);
+                res = Z3_mk_xor(ctx, res, next);
+            }
+            return res;
+        }
+        default:
+            return Z3_mk_false(ctx);
+    }
+}
+
+// MQ 查不到表時，用 Z3 求解並填入該列
+void fill_meas_table_row_with_z3(Z3_context ctx, Z3_solver solver, Z3_ast *meas_vars, Z3_ast *dec_vars, Z3_ast all_commute,
+    size_t key, size_t meas_table_size, MeasToDecodersEntry *meas_to_decoders_table, int num_global_decoders, int global_num_meas,
+    int *table_valid_entries) {
+    if (key >= meas_table_size || !meas_to_decoders_table) return;
+    MeasToDecodersEntry *e = &meas_to_decoders_table[key];
+    if (!e->c) return;
+
+    Z3_solver_push(ctx, solver);
+
+    Z3_solver_assert(ctx, solver, all_commute);
+
+    for (int i = 0; i < global_num_meas; i++) {
+        bool bit = ((key >> i) & 1) != 0;
+        Z3_ast val = bit ? Z3_mk_true(ctx) : Z3_mk_false(ctx);
+        Z3_solver_assert(ctx, solver, Z3_mk_eq(ctx, meas_vars[i], val));
+    }
+
+    Z3_lbool res = Z3_solver_check(ctx, solver);
+    if (res == Z3_L_TRUE) {
+        Z3_model model = Z3_solver_get_model(ctx, solver);
+        Z3_model_inc_ref(ctx, model);
+        for (int j = 0; j < num_global_decoders; j++) {
+            Z3_ast eval_res;
+            Z3_model_eval(ctx, model, dec_vars[j], true, &eval_res);
+            e->c[j] = (Z3_get_bool_value(ctx, eval_res) == Z3_L_TRUE);
+        }
+        Z3_model_dec_ref(ctx, model);
+    } else {
+        for (int j = 0; j < num_global_decoders; j++) {
+            e->c[j] = false;
+        }
+    }
+
+    Z3_solver_pop(ctx, solver, 1);
+    e->valid = true;
+    if (table_valid_entries) (*table_valid_entries)++;
+
+    fprintf(stderr, "[Table] MQ Z3 填 key=%zu columns:", key);
+    for (int d = 0; d < num_global_decoders; d++)
+        fprintf(stderr, " %d", e->c[d] ? 1 : 0);
+    fprintf(stderr, "\n");
+}
 
 // 在給定 valuation vals[1..n] 下評估 boolformula_t
 bool eval_boolformula_with_vals(boolformula_t *f, const bool *vals) {

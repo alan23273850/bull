@@ -16,6 +16,7 @@
 #if !defined(_WIN32)
 #include <ucontext.h>
 #endif
+#include <z3.h>
 #include "../core/type.h"
 #include "../core/bitvector.h"
 #include "../core/boolformula.h"
@@ -67,6 +68,14 @@ char *json_escape(const char *s);
 
 // 把測量向量 bv 轉成表格 key。BULL 慣例：index 0 為輸出/特殊，index 1..length-1 為輸入，故只取 1..length-1 建 key
 size_t meas_bv_to_key(bitvector *bv);
+
+// 將 boolformula_t 轉換為 Z3_ast（供 solver 使用）
+Z3_ast encode_boolformula_to_z3_ast(Z3_context ctx, boolformula_t *f, Z3_ast *meas_vars);
+
+// MQ 查不到表時，用 Z3 求解並填入該列；table_valid_entries 可為 NULL 或傳入指標以累加
+void fill_meas_table_row_with_z3(Z3_context ctx, Z3_solver solver, Z3_ast *meas_vars, Z3_ast *dec_vars, Z3_ast all_commute,
+    size_t key, size_t meas_table_size, MeasToDecodersEntry *meas_to_decoders_table, int num_global_decoders, int global_num_meas,
+    int *table_valid_entries);
 
 // MQ 填表時：當前 learner 用隨機，其他 learner 用其 conjecture 評估結果，不讓其他人因此列出現反例
 void fill_meas_table_row_for_mq(size_t key, int current_id, size_t meas_table_size, MeasToDecodersEntry *meas_to_decoders_table, int num_global_decoders, int global_num_meas, boolformula_t **pending_formula);

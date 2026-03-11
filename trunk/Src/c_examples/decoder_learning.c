@@ -80,100 +80,6 @@ static Z3_ast z3_all_commute = NULL;
 
 static int table_valid_entries = 0; // 統計 table 中被用到的 valid entry 數量
 
-// 將 boolformula_t 轉換為 Z3_ast
-static Z3_ast encode_boolformula_to_z3_ast(Z3_context ctx, boolformula_t *f, Z3_ast *meas_vars) {
-    if (!f) return Z3_mk_false(ctx);
-    switch (boolformula_get_type(f)) {
-        case literal: {
-            lit l = boolformula_get_value(f);
-            var v = boolformula_var_from_lit(l);
-            if (v < 1) return Z3_mk_false(ctx);
-            Z3_ast ast = meas_vars[v - 1];
-            return boolformula_positive_lit(l) ? ast : Z3_mk_not(ctx, ast);
-        }
-        case conjunct: {
-            uscalar_t len = boolformula_get_length(f);
-            if (len == 0) return Z3_mk_true(ctx);
-            Z3_ast *args = (Z3_ast *)malloc(len * sizeof(Z3_ast));
-            for (uscalar_t i = 0; i < len; i++) {
-                args[i] = encode_boolformula_to_z3_ast(ctx, boolformula_get_subformula(f, i), meas_vars);
-            }
-            Z3_ast res = Z3_mk_and(ctx, len, args);
-            free(args);
-            return res;
-        }
-        case disjunct: {
-            uscalar_t len = boolformula_get_length(f);
-            if (len == 0) return Z3_mk_false(ctx);
-            Z3_ast *args = (Z3_ast *)malloc(len * sizeof(Z3_ast));
-            for (uscalar_t i = 0; i < len; i++) {
-                args[i] = encode_boolformula_to_z3_ast(ctx, boolformula_get_subformula(f, i), meas_vars);
-            }
-            Z3_ast res = Z3_mk_or(ctx, len, args);
-            free(args);
-            return res;
-        }
-        case exclusive_disjunct: {
-            uscalar_t len = boolformula_get_length(f);
-            if (len == 0) return Z3_mk_false(ctx);
-            if (len == 1) return encode_boolformula_to_z3_ast(ctx, boolformula_get_subformula(f, 0), meas_vars);
-            Z3_ast res = encode_boolformula_to_z3_ast(ctx, boolformula_get_subformula(f, 0), meas_vars);
-            for (uscalar_t i = 1; i < len; i++) {
-                Z3_ast next = encode_boolformula_to_z3_ast(ctx, boolformula_get_subformula(f, i), meas_vars);
-                res = Z3_mk_xor(ctx, res, next);
-            }
-            return res;
-        }
-        default:
-            return Z3_mk_false(ctx);
-    }
-}
-
-// MQ 查不到表時，用 Z3 求解
-static void fill_meas_table_row_with_z3(size_t key, size_t meas_table_size, MeasToDecodersEntry *meas_to_decoders_table, int num_global_decoders, int global_num_meas) {
-    if (key >= meas_table_size || !meas_to_decoders_table) return;
-    MeasToDecodersEntry *e = &meas_to_decoders_table[key];
-    if (!e->c) return;
-
-    Z3_solver_push(z3_ctx, z3_solver);
-    
-    // 找正確答案: smt2_str + all_commute_name
-    Z3_solver_assert(z3_ctx, z3_solver, z3_all_commute);
-    
-    // 固定 meas_vars == key
-    for (int i = 0; i < global_num_meas; i++) {
-        bool bit = ((key >> i) & 1) != 0;
-        Z3_ast val = bit ? Z3_mk_true(z3_ctx) : Z3_mk_false(z3_ctx);
-        Z3_solver_assert(z3_ctx, z3_solver, Z3_mk_eq(z3_ctx, z3_meas_vars[i], val));
-    }
-    
-    Z3_lbool res = Z3_solver_check(z3_ctx, z3_solver);
-    if (res == Z3_L_TRUE) {
-        Z3_model model = Z3_solver_get_model(z3_ctx, z3_solver);
-        Z3_model_inc_ref(z3_ctx, model);
-        for (int j = 0; j < num_global_decoders; j++) {
-            Z3_ast eval_res;
-            Z3_model_eval(z3_ctx, model, z3_dec_vars[j], true, &eval_res);
-            e->c[j] = (Z3_get_bool_value(z3_ctx, eval_res) == Z3_L_TRUE);
-        }
-        Z3_model_dec_ref(z3_ctx, model);
-    } else {
-        // UNSAT (BULL 給的 meas 無解) -> 給每個 decoder false
-        for (int j = 0; j < num_global_decoders; j++) {
-            e->c[j] = false;
-        }
-    }
-    
-    Z3_solver_pop(z3_ctx, z3_solver, 1);
-    e->valid = true;
-    table_valid_entries++;
-    
-    fprintf(stderr, "[Table] MQ Z3 填 key=%zu columns:", key);
-    for (int d = 0; d < num_global_decoders; d++)
-        fprintf(stderr, " %d", e->c[d] ? 1 : 0);
-    fprintf(stderr, "\n");
-}
-
 // ============================================================================
 // 輔助函式：交出控制權 (Yield)
 // ============================================================================
@@ -204,7 +110,7 @@ static membership_result_t membership(void *info, bitvector *bv) {
     MeasToDecodersEntry *e = &meas_to_decoders_table[key];
     if (!e->c) return true;
     if (!e->valid) {
-        fill_meas_table_row_with_z3(key, meas_table_size, meas_to_decoders_table, num_global_decoders, global_num_meas);
+        fill_meas_table_row_with_z3(z3_ctx, z3_solver, z3_meas_vars, z3_dec_vars, z3_all_commute, key, meas_table_size, meas_to_decoders_table, num_global_decoders, global_num_meas, &table_valid_entries);
     }
     bool out = e->c[current_learner_id];
     fprintf(stderr, "[MQ] learner=%d key=%zu -> %d\n", current_learner_id, key, out ? 1 : 0);
@@ -449,7 +355,7 @@ EXPORT char *decoder_learning_in_C(
             
             // 確保這個 key 在表裡有正確答案
             if (!meas_to_decoders_table[key].valid) {
-                fill_meas_table_row_with_z3(key, meas_table_size, meas_to_decoders_table, num_decoders, global_num_meas);
+                fill_meas_table_row_with_z3(z3_ctx, z3_solver, z3_meas_vars, z3_dec_vars, z3_all_commute, key, meas_table_size, meas_to_decoders_table, num_decoders, global_num_meas, &table_valid_entries);
             }
             
             // 找出哪些 learner 猜錯了，給他們反例並喚醒
