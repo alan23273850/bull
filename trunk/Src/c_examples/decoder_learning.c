@@ -8,10 +8,10 @@
  * - 透過 ucontext_t 進行 Context Switch，避免使用 Pthread 帶來的 Race Condition 與 Mutex 成本。
  * - 當 Learner 遇到 Equivalence Query (EQ) 時，會主動 yield (交出控制權) 給 Dispatcher。
  *
- * 2. 表驅動的 Membership Query (MQ)：
- * - 維護一個全域的 meas_to_decoders_table (大小為 2^num_meas)。
- * - 當 Learner 提出 MQ 時，先查表；若表未填 (valid == false)，則呼叫 Z3 求解器
- * 將該 key 代入 all_commute 定義中，解出所有 Decoder 的正確答案並存入表中。
+ * 2. 稀疏表驅動的 Membership Query (MQ)：
+ * - 維護全域的 key -> decoders row hash map（只存實際查詢到的 key）。
+ * - 當 Learner 提出 MQ 時，先查 map；若 row 未填 (valid == false)，則呼叫 Z3 求解器
+ * 將該 key 代入 all_commute 定義中，解出所有 Decoder 的正確答案並存入 row。
  *
  * 3. 全域 Equivalence Query (Global EQ) 檢查與防禦性機制：
  * - 當所有尚未完成的 Learner 都停在 EQ 時 (L_WAIT_EQ)，Dispatcher 會進行全域檢查。
@@ -56,9 +56,16 @@
  #define EXPORT __attribute__((visibility("default")))
  #endif
  
- static MeasToDecodersEntry *meas_to_decoders_table = NULL;
- static size_t meas_table_size = 0;       // 表格大小，為 2^num_meas
  static int num_global_decoders = 0;
+typedef struct MeasRowNode {
+    size_t key;
+    bool valid;
+    bool *c;  // 長度 num_global_decoders
+    struct MeasRowNode *next;
+} MeasRowNode;
+
+static MeasRowNode **meas_row_map = NULL;
+static size_t meas_row_map_buckets = 0;
  
  // Global EQ：負責在 Learner 與 Dispatcher 之間傳遞資料
  static boolformula_t **pending_formula = NULL;   // Learner 交出的猜測公式 (Hypothesis)
@@ -79,6 +86,108 @@
  static Z3_ast z3_all_commute = NULL;
  
  static int table_valid_entries = 0; // 統計 table 中已填寫的有效資料數
+
+#define MEAS_ROW_MAP_BUCKETS (1u << 15)
+#define MEAS_KEY_MAX_BITS ((int)(sizeof(size_t) * 8))
+
+static size_t meas_row_hash(size_t key) {
+    // 64-bit mix;在 32-bit size_t 也可正常退化運作
+    key ^= key >> 33;
+    key *= (size_t)0xff51afd7ed558ccdULL;
+    key ^= key >> 33;
+    key *= (size_t)0xc4ceb9fe1a85ec53ULL;
+    key ^= key >> 33;
+    return key;
+}
+
+static int meas_row_map_init(void) {
+    meas_row_map_buckets = (size_t)MEAS_ROW_MAP_BUCKETS;
+    meas_row_map = (MeasRowNode **)calloc(meas_row_map_buckets, sizeof(MeasRowNode *));
+    return meas_row_map ? 1 : 0;
+}
+
+static MeasRowNode *meas_row_map_find(size_t key) {
+    if (!meas_row_map || meas_row_map_buckets == 0) return NULL;
+    size_t b = meas_row_hash(key) % meas_row_map_buckets;
+    MeasRowNode *cur = meas_row_map[b];
+    while (cur) {
+        if (cur->key == key) return cur;
+        cur = cur->next;
+    }
+    return NULL;
+}
+
+static MeasRowNode *meas_row_map_get_or_create(size_t key) {
+    MeasRowNode *found = meas_row_map_find(key);
+    if (found) return found;
+    if (!meas_row_map || meas_row_map_buckets == 0) return NULL;
+
+    size_t b = meas_row_hash(key) % meas_row_map_buckets;
+    MeasRowNode *node = (MeasRowNode *)calloc(1, sizeof(MeasRowNode));
+    if (!node) return NULL;
+    node->key = key;
+    node->valid = false;
+    node->c = (bool *)calloc((size_t)num_global_decoders, sizeof(bool));
+    if (!node->c) {
+        free(node);
+        return NULL;
+    }
+    node->next = meas_row_map[b];
+    meas_row_map[b] = node;
+    return node;
+}
+
+static void meas_row_map_free_all(void) {
+    if (!meas_row_map) return;
+    for (size_t b = 0; b < meas_row_map_buckets; b++) {
+        MeasRowNode *cur = meas_row_map[b];
+        while (cur) {
+            MeasRowNode *nxt = cur->next;
+            free(cur->c);
+            free(cur);
+            cur = nxt;
+        }
+    }
+    free(meas_row_map);
+    meas_row_map = NULL;
+    meas_row_map_buckets = 0;
+}
+
+static void fill_meas_row_with_z3(size_t key, MeasRowNode *row) {
+    if (!row || !row->c) return;
+    if (row->valid) return;
+
+    Z3_solver_push(z3_ctx, z3_solver);
+    Z3_solver_assert(z3_ctx, z3_solver, z3_all_commute);
+    for (int i = 0; i < global_num_meas && i < MEAS_KEY_MAX_BITS; i++) {
+        bool bit = ((key >> i) & 1) != 0;
+        Z3_ast val = bit ? Z3_mk_true(z3_ctx) : Z3_mk_false(z3_ctx);
+        Z3_solver_assert(z3_ctx, z3_solver, Z3_mk_eq(z3_ctx, z3_meas_vars[i], val));
+    }
+
+    Z3_lbool res = Z3_solver_check(z3_ctx, z3_solver);
+    if (res == Z3_L_TRUE) {
+        Z3_model model = Z3_solver_get_model(z3_ctx, z3_solver);
+        Z3_model_inc_ref(z3_ctx, model);
+        for (int j = 0; j < num_global_decoders; j++) {
+            Z3_ast eval_res;
+            Z3_model_eval(z3_ctx, model, z3_dec_vars[j], true, &eval_res);
+            row->c[j] = (Z3_get_bool_value(z3_ctx, eval_res) == Z3_L_TRUE);
+        }
+        Z3_model_dec_ref(z3_ctx, model);
+    } else {
+        for (int j = 0; j < num_global_decoders; j++) {
+            row->c[j] = false;
+        }
+    }
+    Z3_solver_pop(z3_ctx, z3_solver, 1);
+    row->valid = true;
+    table_valid_entries++;
+
+    fprintf(stderr, "[Table] MQ/CE Z3 填 key=%zu columns:", key);
+    for (int d = 0; d < num_global_decoders; d++) fprintf(stderr, " %d", row->c[d] ? 1 : 0);
+    fprintf(stderr, "\n");
+}
  
  // ============================================================================
  // 輔助函式：交出控制權 (Yield)
@@ -98,22 +207,15 @@
  // 將測量結果 (meas) 轉為 key 查表。若表未填，呼叫 Z3 解出該 key 下所有 Decoder 的答案並記錄。
  static membership_result_t membership(void *info, bitvector *bv) {
      (void)info;
-     if (!meas_to_decoders_table || current_learner_id < 0 || current_learner_id >= num_global_decoders) {
+    if (!meas_row_map || current_learner_id < 0 || current_learner_id >= num_global_decoders) {
          fprintf(stderr, "[MQ] learner=%d 表未就緒或 id 無效，回傳 true\n", current_learner_id);
          return true;
      }
      size_t key = meas_bv_to_key(bv);
-     if (key >= meas_table_size) {
-         fprintf(stderr, "[MQ] learner=%d key=%zu 超出表大小，拋出錯誤\n", current_learner_id, key);
-         abort();
-     }
-     MeasToDecodersEntry *e = &meas_to_decoders_table[key];
-     if (!e->c) return true;
-     if (!e->valid) {
-         // 表內無資料，呼叫 Z3 進行全域求解並填滿該 row
-         fill_meas_table_row_with_z3(z3_ctx, z3_solver, z3_meas_vars, z3_dec_vars, z3_all_commute, key, meas_table_size, meas_to_decoders_table, num_global_decoders, global_num_meas, &table_valid_entries);
-     }
-     bool out = e->c[current_learner_id];
+    MeasRowNode *e = meas_row_map_get_or_create(key);
+    if (!e || !e->c) return true;
+    if (!e->valid) fill_meas_row_with_z3(key, e);
+    bool out = e->c[current_learner_id];
      fprintf(stderr, "[MQ] learner=%d key=%zu -> %d\n", current_learner_id, key, out ? 1 : 0);
      return out;
  }
@@ -200,8 +302,8 @@
      global_num_meas = num_meas;
      table_valid_entries = 0;
      current_learner_id = -1;
-     meas_to_decoders_table = NULL;
-     meas_table_size = 0;
+    meas_row_map = NULL;
+    meas_row_map_buckets = 0;
      pending_formula = NULL;
      eq_pending_result = NULL;
      global_learners = NULL;
@@ -218,6 +320,16 @@
          if (json_result) { json_result[0] = '{'; json_result[1] = '}'; json_result[2] = '\0'; }
          return json_result;
      }
+    if (num_meas > MEAS_KEY_MAX_BITS) {
+        fprintf(stderr,
+                "[decoder_learning_in_C] 致命錯誤：num_meas=%d 超過 key 編碼上限 %d bits (size_t)。\n",
+                num_meas, MEAS_KEY_MAX_BITS);
+        fprintf(stderr,
+                "[decoder_learning_in_C] 已中止學習以避免 meas key 截斷造成錯誤 decoder。\n");
+        json_result = (char *)malloc(3);
+        if (json_result) { json_result[0] = '{'; json_result[1] = '}'; json_result[2] = '\0'; }
+        return json_result;
+    }
  
      // 初始化 Z3 求解器環境
      Z3_config cfg = Z3_mk_config();
@@ -245,15 +357,8 @@
      }
      z3_all_commute = Z3_mk_const(z3_ctx, Z3_mk_string_symbol(z3_ctx, all_commute_name), bool_sort);
  
-     // 初始化 MQ 表格：大小為 2^num_meas
-     meas_table_size = (size_t)1 << (num_meas <= (int)(sizeof(size_t) * 8) ? num_meas : 0);
-     meas_to_decoders_table = (MeasToDecodersEntry *)calloc(meas_table_size, sizeof(MeasToDecodersEntry));
-     if (meas_to_decoders_table) {
-         for (size_t k = 0; k < meas_table_size; k++) {
-             meas_to_decoders_table[k].valid = false;
-             meas_to_decoders_table[k].c = (bool *)calloc((size_t)num_decoders, sizeof(bool));
-         }
-     }
+    // 初始化稀疏 MQ 表格（hash map），避免 2^num_meas 全表配置
+    if (!meas_row_map_init()) goto cleanup;
  
      pending_formula = (boolformula_t **)calloc((size_t)num_decoders, sizeof(boolformula_t *));
      eq_pending_result = (equivalence_result_t **)calloc((size_t)num_decoders, sizeof(equivalence_result_t *));
@@ -335,7 +440,7 @@
              Z3_model model = Z3_solver_get_model(z3_ctx, z3_solver);
              Z3_model_inc_ref(z3_ctx, model);
              
-             for (int i = 0; i < global_num_meas && i < sizeof(size_t) * 8; i++) {
+            for (int i = 0; i < global_num_meas && i < MEAS_KEY_MAX_BITS; i++) {
                  Z3_ast eval_res;
                  Z3_model_eval(z3_ctx, model, z3_meas_vars[i], true, &eval_res);
                  if (Z3_get_bool_value(z3_ctx, eval_res) == Z3_L_TRUE) {
@@ -344,7 +449,14 @@
              }
  
              // 檢查該 key 是否已在表內
-             if (meas_to_decoders_table[key].valid) {
+            MeasRowNode *row = meas_row_map_get_or_create(key);
+            if (!row) {
+                Z3_model_dec_ref(z3_ctx, model);
+                Z3_solver_pop(z3_ctx, z3_solver, 1);
+                goto cleanup;
+            }
+
+            if (row->valid) {
                  // 檢查是否真的有等待中的 Learner 猜測與 Table 不符
                  bool any_learner_wrong = false;
                  int n = global_num_meas > 0 ? global_num_meas : 1;
@@ -354,7 +466,7 @@
                  for (int i = 0; i < num_decoders; i++) {
                      if (global_learners[i].state != L_WAIT_EQ) continue;
                      bool pred = pending_formula[i] ? eval_boolformula_with_vals(pending_formula[i], vals) : false;
-                     bool truth = meas_to_decoders_table[key].c[i];
+                    bool truth = row->c[i];
                      if (pred != truth) {
                          any_learner_wrong = true;
                          break;
@@ -383,9 +495,7 @@
              Z3_solver_pop(z3_ctx, z3_solver, 1);
              
              // 填表確保該 key 有標準答案
-             if (!meas_to_decoders_table[key].valid) {
-                 fill_meas_table_row_with_z3(z3_ctx, z3_solver, z3_meas_vars, z3_dec_vars, z3_all_commute, key, meas_table_size, meas_to_decoders_table, num_decoders, global_num_meas, &table_valid_entries);
-             }
+            if (!row->valid) fill_meas_row_with_z3(key, row);
              
              // 喚醒猜錯的 Learner 並分派反例
              int n = global_num_meas > 0 ? global_num_meas : 1;
@@ -395,7 +505,7 @@
              for (int i = 0; i < num_decoders; i++) {
                  if (global_learners[i].state != L_WAIT_EQ) continue;
                  bool pred = pending_formula[i] ? eval_boolformula_with_vals(pending_formula[i], vals) : false;
-                 bool truth = meas_to_decoders_table[key].c[i];
+                bool truth = row->c[i];
                  if (pred != truth) {
                      equivalence_result_t *r = (equivalence_result_t *)malloc(sizeof(equivalence_result_t));
                      r->is_equal = false;
@@ -459,7 +569,8 @@
  cleanup:
      // 當發生異常跳轉時，json_result 仍為 NULL，這裡會補上 "{}" 回傳給 Python，不留髒記憶體
      if (!json_result) json_result = strdup("{}");
-     cleanup_learning_resources(&meas_to_decoders_table, meas_table_size,
+    meas_row_map_free_all();
+    cleanup_learning_resources(NULL, 0,
                                 &pending_formula, num_decoders,
                                 &eq_pending_result,
                                 &global_learners);
