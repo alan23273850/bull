@@ -1,0 +1,49 @@
+# Build artifacts
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.out
+
+# Debug / profiler artifacts
+*.dSYM/
+*.gcda
+*.gcno
+*.prof
+*.gmon
+*.stackdump
+
+# Editor / OS noise
+*~
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# CMake / autotools temporary files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+Makefile.in
+aclocal.m4
+autom4te.cache/
+
+# Common test/runtime logs and dumps
+*.log
+*.tmp
+*.bak
+
+# OCaml build artifacts
+*.cmi
+*.cmo
+*.cmx
+*.cmxa
+*.cmxs
+
+# Local example binaries
+trunk/Src/cpp_examples/learn
