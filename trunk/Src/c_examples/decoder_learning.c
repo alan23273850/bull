@@ -31,6 +31,7 @@
  #include <stdlib.h>
  #include <string.h>
  #include <stdbool.h>
+#include <stdint.h>
  
  // 引入協程所需的標頭檔 (POSIX 標準)
  #if !defined(_WIN32)
@@ -58,14 +59,19 @@
  
  static int num_global_decoders = 0;
 typedef struct MeasRowNode {
-    size_t key;
+    bool used;
     bool valid;
+    uint64_t hash;
+    uint64_t *key_words;  // 長度 global_key_words
     bool *c;  // 長度 num_global_decoders
-    struct MeasRowNode *next;
 } MeasRowNode;
 
-static MeasRowNode **meas_row_map = NULL;
+static MeasRowNode *meas_row_map = NULL;
 static size_t meas_row_map_buckets = 0;
+static size_t meas_row_map_size = 0;
+static size_t global_key_words = 0;
+static uint64_t *scratch_key_words = NULL;
+static size_t scratch_key_words_cap = 0;
  
  // Global EQ：負責在 Learner 與 Dispatcher 之間傳遞資料
  static boolformula_t **pending_formula = NULL;   // Learner 交出的猜測公式 (Hypothesis)
@@ -88,79 +94,147 @@ static size_t meas_row_map_buckets = 0;
  static int table_valid_entries = 0; // 統計 table 中已填寫的有效資料數
 
 #define MEAS_ROW_MAP_BUCKETS (1u << 15)
-#define MEAS_KEY_MAX_BITS ((int)(sizeof(size_t) * 8))
+#define MEAS_ROW_MAP_LOAD_NUM 7u
+#define MEAS_ROW_MAP_LOAD_DEN 10u
 
-static size_t meas_row_hash(size_t key) {
-    // 64-bit mix;在 32-bit size_t 也可正常退化運作
-    key ^= key >> 33;
-    key *= (size_t)0xff51afd7ed558ccdULL;
-    key ^= key >> 33;
-    key *= (size_t)0xc4ceb9fe1a85ec53ULL;
-    key ^= key >> 33;
-    return key;
+static inline bool meas_key_get_bit(const uint64_t *key_words, int bit_idx) {
+    size_t w = (size_t)bit_idx >> 6;
+    unsigned b = (unsigned)bit_idx & 63u;
+    return ((key_words[w] >> b) & 1ULL) != 0ULL;
+}
+
+static inline void meas_key_set_bit(uint64_t *key_words, int bit_idx) {
+    size_t w = (size_t)bit_idx >> 6;
+    unsigned b = (unsigned)bit_idx & 63u;
+    key_words[w] |= (1ULL << b);
+}
+
+static uint64_t meas_key_hash(const uint64_t *key_words, size_t words) {
+    // FNV-1a 64-bit
+    uint64_t h = 1469598103934665603ULL;
+    const uint8_t *bytes = (const uint8_t *)key_words;
+    size_t n = words * sizeof(uint64_t);
+    for (size_t i = 0; i < n; i++) {
+        h ^= (uint64_t)bytes[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static int ensure_scratch_key_words(size_t need_words) {
+    if (scratch_key_words_cap >= need_words) return 1;
+    uint64_t *new_buf = (uint64_t *)realloc(scratch_key_words, need_words * sizeof(uint64_t));
+    if (!new_buf) return 0;
+    scratch_key_words = new_buf;
+    scratch_key_words_cap = need_words;
+    return 1;
 }
 
 static int meas_row_map_init(void) {
     meas_row_map_buckets = (size_t)MEAS_ROW_MAP_BUCKETS;
-    meas_row_map = (MeasRowNode **)calloc(meas_row_map_buckets, sizeof(MeasRowNode *));
+    meas_row_map_size = 0;
+    meas_row_map = (MeasRowNode *)calloc(meas_row_map_buckets, sizeof(MeasRowNode));
     return meas_row_map ? 1 : 0;
 }
 
-static MeasRowNode *meas_row_map_find(size_t key) {
-    if (!meas_row_map || meas_row_map_buckets == 0) return NULL;
-    size_t b = meas_row_hash(key) % meas_row_map_buckets;
-    MeasRowNode *cur = meas_row_map[b];
-    while (cur) {
-        if (cur->key == key) return cur;
-        cur = cur->next;
+static size_t meas_row_map_find_slot(const uint64_t *key_words, uint64_t hash, int *found) {
+    size_t mask = meas_row_map_buckets - 1; // buckets must be power-of-two
+    size_t idx = (size_t)hash & mask;
+    for (;;) {
+        MeasRowNode *slot = &meas_row_map[idx];
+        if (!slot->used) {
+            *found = 0;
+            return idx;
+        }
+        if (slot->hash == hash &&
+            slot->key_words &&
+            memcmp(slot->key_words, key_words, global_key_words * sizeof(uint64_t)) == 0) {
+            *found = 1;
+            return idx;
+        }
+        idx = (idx + 1) & mask;
     }
-    return NULL;
 }
 
-static MeasRowNode *meas_row_map_get_or_create(size_t key) {
-    MeasRowNode *found = meas_row_map_find(key);
-    if (found) return found;
+static int meas_row_map_rehash(size_t new_buckets) {
+    MeasRowNode *old_map = meas_row_map;
+    size_t old_buckets = meas_row_map_buckets;
+
+    MeasRowNode *new_map = (MeasRowNode *)calloc(new_buckets, sizeof(MeasRowNode));
+    if (!new_map) return 0;
+
+    meas_row_map = new_map;
+    meas_row_map_buckets = new_buckets;
+    meas_row_map_size = 0;
+
+    size_t mask = new_buckets - 1;
+    for (size_t i = 0; i < old_buckets; i++) {
+        MeasRowNode *old = &old_map[i];
+        if (!old->used) continue;
+        size_t idx = (size_t)old->hash & mask;
+        while (new_map[idx].used) idx = (idx + 1) & mask;
+        new_map[idx] = *old;
+        meas_row_map_size++;
+    }
+
+    free(old_map);
+    return 1;
+}
+
+static MeasRowNode *meas_row_map_get_or_create(const uint64_t *key_words) {
     if (!meas_row_map || meas_row_map_buckets == 0) return NULL;
 
-    size_t b = meas_row_hash(key) % meas_row_map_buckets;
-    MeasRowNode *node = (MeasRowNode *)calloc(1, sizeof(MeasRowNode));
-    if (!node) return NULL;
-    node->key = key;
-    node->valid = false;
-    node->c = (bool *)calloc((size_t)num_global_decoders, sizeof(bool));
-    if (!node->c) {
-        free(node);
+    if ((meas_row_map_size + 1) * MEAS_ROW_MAP_LOAD_DEN >
+        meas_row_map_buckets * MEAS_ROW_MAP_LOAD_NUM) {
+        if (!meas_row_map_rehash(meas_row_map_buckets << 1)) return NULL;
+    }
+
+    uint64_t hash = meas_key_hash(key_words, global_key_words);
+    int found = 0;
+    size_t idx = meas_row_map_find_slot(key_words, hash, &found);
+    MeasRowNode *slot = &meas_row_map[idx];
+    if (found) return slot;
+
+    slot->used = true;
+    slot->valid = false;
+    slot->hash = hash;
+    slot->key_words = (uint64_t *)malloc(global_key_words * sizeof(uint64_t));
+    if (!slot->key_words) {
+        memset(slot, 0, sizeof(*slot));
         return NULL;
     }
-    node->next = meas_row_map[b];
-    meas_row_map[b] = node;
-    return node;
+    memcpy(slot->key_words, key_words, global_key_words * sizeof(uint64_t));
+    slot->c = (bool *)calloc((size_t)num_global_decoders, sizeof(bool));
+    if (!slot->c) {
+        free(slot->key_words);
+        memset(slot, 0, sizeof(*slot));
+        return NULL;
+    }
+    meas_row_map_size++;
+    return slot;
 }
 
 static void meas_row_map_free_all(void) {
     if (!meas_row_map) return;
-    for (size_t b = 0; b < meas_row_map_buckets; b++) {
-        MeasRowNode *cur = meas_row_map[b];
-        while (cur) {
-            MeasRowNode *nxt = cur->next;
-            free(cur->c);
-            free(cur);
-            cur = nxt;
-        }
+    for (size_t i = 0; i < meas_row_map_buckets; i++) {
+        if (!meas_row_map[i].used) continue;
+        free(meas_row_map[i].key_words);
+        free(meas_row_map[i].c);
     }
     free(meas_row_map);
     meas_row_map = NULL;
     meas_row_map_buckets = 0;
+    meas_row_map_size = 0;
 }
 
-static void fill_meas_row_with_z3(size_t key, MeasRowNode *row) {
+static void fill_meas_row_with_z3(const uint64_t *key_words, MeasRowNode *row) {
     if (!row || !row->c) return;
     if (row->valid) return;
 
     Z3_solver_push(z3_ctx, z3_solver);
     Z3_solver_assert(z3_ctx, z3_solver, z3_all_commute);
-    for (int i = 0; i < global_num_meas && i < MEAS_KEY_MAX_BITS; i++) {
-        bool bit = ((key >> i) & 1) != 0;
+    for (int i = 0; i < global_num_meas; i++) {
+        bool bit = meas_key_get_bit(key_words, i);
         Z3_ast val = bit ? Z3_mk_true(z3_ctx) : Z3_mk_false(z3_ctx);
         Z3_solver_assert(z3_ctx, z3_solver, Z3_mk_eq(z3_ctx, z3_meas_vars[i], val));
     }
@@ -184,7 +258,7 @@ static void fill_meas_row_with_z3(size_t key, MeasRowNode *row) {
     row->valid = true;
     table_valid_entries++;
 
-    fprintf(stderr, "[Table] MQ/CE Z3 填 key=%zu columns:", key);
+    fprintf(stderr, "[Table] MQ/CE Z3 填 hash=0x%llx columns:", (unsigned long long)row->hash);
     for (int d = 0; d < num_global_decoders; d++) fprintf(stderr, " %d", row->c[d] ? 1 : 0);
     fprintf(stderr, "\n");
 }
@@ -205,18 +279,30 @@ static void fill_meas_row_with_z3(size_t key, MeasRowNode *row) {
  
  // Membership Query (MQ)：
  // 將測量結果 (meas) 轉為 key 查表。若表未填，呼叫 Z3 解出該 key 下所有 Decoder 的答案並記錄。
+static void meas_key_from_bv(bitvector *bv, uint64_t *out_words, size_t words) {
+    memset(out_words, 0, words * sizeof(uint64_t));
+    if (!bv || bitvector_length(bv) <= 1) return;
+    size_t len = (size_t)bitvector_length(bv);
+    for (size_t i = 1; i < len; i++) {
+        if (bitvector_get(bv, (uscalar_t)i)) {
+            meas_key_set_bit(out_words, (int)(i - 1));
+        }
+    }
+}
+
  static membership_result_t membership(void *info, bitvector *bv) {
      (void)info;
     if (!meas_row_map || current_learner_id < 0 || current_learner_id >= num_global_decoders) {
          fprintf(stderr, "[MQ] learner=%d 表未就緒或 id 無效，回傳 true\n", current_learner_id);
          return true;
      }
-     size_t key = meas_bv_to_key(bv);
-    MeasRowNode *e = meas_row_map_get_or_create(key);
+    if (!ensure_scratch_key_words(global_key_words)) return true;
+    meas_key_from_bv(bv, scratch_key_words, global_key_words);
+   MeasRowNode *e = meas_row_map_get_or_create(scratch_key_words);
     if (!e || !e->c) return true;
-    if (!e->valid) fill_meas_row_with_z3(key, e);
+   if (!e->valid) fill_meas_row_with_z3(scratch_key_words, e);
     bool out = e->c[current_learner_id];
-     fprintf(stderr, "[MQ] learner=%d key=%zu -> %d\n", current_learner_id, key, out ? 1 : 0);
+    fprintf(stderr, "[MQ] learner=%d hash=0x%llx -> %d\n", current_learner_id, (unsigned long long)e->hash, out ? 1 : 0);
      return out;
  }
  
@@ -300,10 +386,12 @@ static void fill_meas_row_with_z3(size_t key, MeasRowNode *row) {
      global_meas_names = meas_names;
      num_global_decoders = num_decoders;
      global_num_meas = num_meas;
+    global_key_words = (size_t)((num_meas + 63) / 64);
      table_valid_entries = 0;
      current_learner_id = -1;
     meas_row_map = NULL;
     meas_row_map_buckets = 0;
+    meas_row_map_size = 0;
      pending_formula = NULL;
      eq_pending_result = NULL;
      global_learners = NULL;
@@ -312,6 +400,8 @@ static void fill_meas_row_with_z3(size_t key, MeasRowNode *row) {
      z3_meas_vars = NULL;
      z3_dec_vars = NULL;
      z3_all_commute = NULL;
+    scratch_key_words = NULL;
+    scratch_key_words_cap = 0;
  
      char *json_result = NULL;
  
@@ -320,16 +410,7 @@ static void fill_meas_row_with_z3(size_t key, MeasRowNode *row) {
          if (json_result) { json_result[0] = '{'; json_result[1] = '}'; json_result[2] = '\0'; }
          return json_result;
      }
-    if (num_meas > MEAS_KEY_MAX_BITS) {
-        fprintf(stderr,
-                "[decoder_learning_in_C] 致命錯誤：num_meas=%d 超過 key 編碼上限 %d bits (size_t)。\n",
-                num_meas, MEAS_KEY_MAX_BITS);
-        fprintf(stderr,
-                "[decoder_learning_in_C] 已中止學習以避免 meas key 截斷造成錯誤 decoder。\n");
-        json_result = (char *)malloc(3);
-        if (json_result) { json_result[0] = '{'; json_result[1] = '}'; json_result[2] = '\0'; }
-        return json_result;
-    }
+    if (global_key_words == 0) global_key_words = 1;
  
      // 初始化 Z3 求解器環境
      Z3_config cfg = Z3_mk_config();
@@ -436,20 +517,25 @@ static void fill_meas_row_with_z3(size_t key, MeasRowNode *row) {
  
          if (res == Z3_L_TRUE) {
              // SAT：找到反例
-             size_t key = 0;
              Z3_model model = Z3_solver_get_model(z3_ctx, z3_solver);
              Z3_model_inc_ref(z3_ctx, model);
-             
-            for (int i = 0; i < global_num_meas && i < MEAS_KEY_MAX_BITS; i++) {
+            if (!ensure_scratch_key_words(global_key_words)) {
+                Z3_model_dec_ref(z3_ctx, model);
+                Z3_solver_pop(z3_ctx, z3_solver, 1);
+                goto cleanup;
+            }
+            memset(scratch_key_words, 0, global_key_words * sizeof(uint64_t));
+
+           for (int i = 0; i < global_num_meas; i++) {
                  Z3_ast eval_res;
                  Z3_model_eval(z3_ctx, model, z3_meas_vars[i], true, &eval_res);
                  if (Z3_get_bool_value(z3_ctx, eval_res) == Z3_L_TRUE) {
-                     key |= ((size_t)1 << i);
+                    meas_key_set_bit(scratch_key_words, i);
                  }
              }
  
              // 檢查該 key 是否已在表內
-            MeasRowNode *row = meas_row_map_get_or_create(key);
+           MeasRowNode *row = meas_row_map_get_or_create(scratch_key_words);
             if (!row) {
                 Z3_model_dec_ref(z3_ctx, model);
                 Z3_solver_pop(z3_ctx, z3_solver, 1);
@@ -461,7 +547,7 @@ static void fill_meas_row_with_z3(size_t key, MeasRowNode *row) {
                  bool any_learner_wrong = false;
                  int n = global_num_meas > 0 ? global_num_meas : 1;
                  bool *vals = (bool *)malloc((size_t)(n + 1) * sizeof(bool));
-                 for (int v = 1; v <= n; v++) vals[v] = ((key >> (v - 1)) & 1) != 0;
+                for (int v = 1; v <= n; v++) vals[v] = meas_key_get_bit(scratch_key_words, v - 1);
  
                  for (int i = 0; i < num_decoders; i++) {
                      if (global_learners[i].state != L_WAIT_EQ) continue;
@@ -475,10 +561,10 @@ static void fill_meas_row_with_z3(size_t key, MeasRowNode *row) {
                  free(vals);
  
                  if (any_learner_wrong) {
-                     fprintf(stderr, "[Dispatcher] Z3 找到反例 key=%zu 已在表內，且有 Learner 預測錯誤，作為有效反例踢回！\n", key);
+                    fprintf(stderr, "[Dispatcher] Z3 找到反例 hash=0x%llx 已在表內，且有 Learner 預測錯誤，作為有效反例踢回！\n", (unsigned long long)row->hash);
                  } else {
                      // 【防禦性編程 (Fail-Fast)】：放棄治療
-                     fprintf(stderr, "[Dispatcher] ⚠ 致命錯誤：Z3 找到反例 key=%zu 已在表內，且所有 Learner 皆正確！\n", key);
+                    fprintf(stderr, "[Dispatcher] ⚠ 致命錯誤：Z3 找到反例 hash=0x%llx 已在表內，且所有 Learner 皆正確！\n", (unsigned long long)row->hash);
                      fprintf(stderr, "這代表 SMT 模型中存在超出糾錯能力極限的 Uncorrectable Error 或物理約束有瑕疵。\n");
                      fprintf(stderr, "觸發防禦機制：放棄治療，直接中斷學習程序並跳至 cleanup。\n");
                      
@@ -487,7 +573,7 @@ static void fill_meas_row_with_z3(size_t key, MeasRowNode *row) {
                      goto cleanup;
                  }
              } else {
-                 fprintf(stderr, "[Dispatcher] Z3 確定採用新反例 key=%zu\n", key);
+                fprintf(stderr, "[Dispatcher] Z3 確定採用新反例 hash=0x%llx\n", (unsigned long long)row->hash);
              }
  
              // 確保 Z3 狀態恢復與資源釋放
@@ -495,12 +581,18 @@ static void fill_meas_row_with_z3(size_t key, MeasRowNode *row) {
              Z3_solver_pop(z3_ctx, z3_solver, 1);
              
              // 填表確保該 key 有標準答案
-            if (!row->valid) fill_meas_row_with_z3(key, row);
-             
+           if (!row->valid) fill_meas_row_with_z3(scratch_key_words, row);
+
+            uint64_t *ce_key_words = (uint64_t *)malloc(global_key_words * sizeof(uint64_t));
+            if (!ce_key_words) {
+                goto cleanup;
+            }
+            memcpy(ce_key_words, scratch_key_words, global_key_words * sizeof(uint64_t));
+
              // 喚醒猜錯的 Learner 並分派反例
              int n = global_num_meas > 0 ? global_num_meas : 1;
              bool *vals = (bool *)malloc((size_t)(n + 1) * sizeof(bool));
-             for (int v = 1; v <= n; v++) vals[v] = ((key >> (v - 1)) & 1) != 0;
+            for (int v = 1; v <= n; v++) vals[v] = meas_key_get_bit(ce_key_words, v - 1);
              
              for (int i = 0; i < num_decoders; i++) {
                  if (global_learners[i].state != L_WAIT_EQ) continue;
@@ -512,7 +604,7 @@ static void fill_meas_row_with_z3(size_t key, MeasRowNode *row) {
                      r->counterexample = bitvector_new((uscalar_t)(n + 1));
                      bitvector_set(r->counterexample, 0, truth);
                      for (int j = 0; j < n; j++)
-                         bitvector_set(r->counterexample, (uscalar_t)(j + 1), ((key >> j) & 1) != 0);
+                        bitvector_set(r->counterexample, (uscalar_t)(j + 1), meas_key_get_bit(ce_key_words, j));
                      eq_pending_result[i] = r;
                      global_learners[i].state = L_RUNNING;
                      current_learner_id = i;
@@ -520,6 +612,7 @@ static void fill_meas_row_with_z3(size_t key, MeasRowNode *row) {
                  }
              }
              free(vals);
+            free(ce_key_words);
  
          } else if (res == Z3_L_FALSE) {
              // UNSAT：數學證明收斂完成！
@@ -570,6 +663,9 @@ static void fill_meas_row_with_z3(size_t key, MeasRowNode *row) {
      // 當發生異常跳轉時，json_result 仍為 NULL，這裡會補上 "{}" 回傳給 Python，不留髒記憶體
      if (!json_result) json_result = strdup("{}");
     meas_row_map_free_all();
+    free(scratch_key_words);
+    scratch_key_words = NULL;
+    scratch_key_words_cap = 0;
     cleanup_learning_resources(NULL, 0,
                                 &pending_formula, num_decoders,
                                 &eq_pending_result,
